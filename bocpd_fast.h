@@ -1,17 +1,10 @@
 /**
- * @file bocpd_fast.h
- * @brief Optimized BOCPD with SIMD (AVX2)
- *
- * Optimizations:
- * - Pre-allocated arrays (no malloc in hot path)
- * - Structure-of-Arrays for SIMD-friendly memory layout
- * - AVX2 vectorized loops
- * - Cached lgamma values
- * - Truncation of low-probability run lengths
+ * @file bocpd_simd.h
+ * @brief Fully optimized BOCPD with AVX2 SIMD
  */
 
-#ifndef BOCPD_FAST_H
-#define BOCPD_FAST_H
+#ifndef BOCPD_SIMD_H
+#define BOCPD_SIMD_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -20,95 +13,67 @@
 extern "C" {
 #endif
 
-/**
- * @brief NormalGamma prior parameters
- */
 typedef struct {
-    double mu;
-    double kappa;
-    double alpha;
-    double beta;
+    double mu0, kappa0, alpha0, beta0;
 } bocpd_prior_t;
 
-/**
- * @brief Optimized BOCPD state (Structure-of-Arrays layout)
- */
 typedef struct {
     /* Configuration */
-    double hazard;              /* 1/lambda */
-    double log_hazard;          /* log(hazard) for numerical stability */
-    double log_one_minus_h;     /* log(1 - hazard) */
-    double trunc_threshold;     /* Truncate run lengths below this probability */
+    double hazard;
+    double one_minus_h;
+    double trunc_thresh;
     bocpd_prior_t prior;
 
-    /* Capacity */
-    size_t capacity;            /* Max run length */
-    size_t active_len;          /* Current number of active run lengths */
+    /* Ring buffer state */
+    size_t capacity;
+    size_t active_len;
+    size_t ring_start;      /* Ring buffer head index */
 
-    /* State: Structure-of-Arrays for SIMD */
-    double *r;                  /* Run-length probabilities [capacity] */
-    double *ss_n;               /* Sufficient stat: count [capacity] */
-    double *ss_sum;             /* Sufficient stat: sum [capacity] */
-    double *ss_sum2;            /* Sufficient stat: sum of squares [capacity] */
+    /* Sufficient stats (ring buffer) */
+    double *ss_n;
+    double *ss_sum;
+    double *ss_sum2;
 
-    /* Pre-allocated work arrays */
-    double *pp;                 /* Predictive probabilities [capacity] */
-    double *r_new;              /* New run-length dist [capacity] */
+    /* Incremental posterior params (ring buffer, updated incrementally) */
+    double *post_kappa;
+    double *post_mu;
+    double *post_alpha;
+    double *post_beta;
 
-    /* Cached values for lgamma (indexed by 2*alpha = n + 2*alpha0) */
-    double *lgamma_cache;       /* [capacity + some margin] */
+    /* Precomputed per-run-length constants for Student-t */
+    double *C1;             /* lgamma terms + constant part */
+    double *C2;             /* (nu+1)/2 */
+    double *inv_sigma;      /* 1/sigma */
+    double *inv_nu;         /* 1/nu */
+
+    /* Work arrays (no ring buffer, linear) */
+    double *pp;
+    double *r;
+    double *r_new;
+
+    /* lgamma cache */
+    double *lgamma_cache;
     size_t lgamma_cache_size;
 
     /* Output */
-    size_t t;                   /* Current timestep */
-    double p_changepoint;       /* P(recent change) */
-    size_t map_runlength;       /* Most likely run length */
-} bocpd_fast_t;
+    size_t t;
+    size_t map_runlength;
+    double p_changepoint;
+} bocpd_simd_t;
 
-/**
- * @brief Initialize optimized BOCPD
- */
-int bocpd_fast_init(bocpd_fast_t *b,
-                    double hazard_lambda,
-                    bocpd_prior_t prior,
-                    size_t max_run_length);
+int bocpd_simd_init(bocpd_simd_t *b, double hazard_lambda, 
+                    bocpd_prior_t prior, size_t max_run_length);
+void bocpd_simd_free(bocpd_simd_t *b);
+void bocpd_simd_reset(bocpd_simd_t *b);
+void bocpd_simd_step(bocpd_simd_t *b, double x);
+double bocpd_simd_change_prob(const bocpd_simd_t *b, size_t window);
 
-/**
- * @brief Free resources
- */
-void bocpd_fast_free(bocpd_fast_t *b);
-
-/**
- * @brief Reset to initial state
- */
-void bocpd_fast_reset(bocpd_fast_t *b);
-
-/**
- * @brief Process observation (main hot path)
- */
-void bocpd_fast_step(bocpd_fast_t *b, double x);
-
-/**
- * @brief Get probability of recent change (within window steps)
- */
-double bocpd_fast_change_prob(const bocpd_fast_t *b, size_t window);
-
-/**
- * @brief Get MAP run length
- */
-static inline size_t bocpd_fast_get_map_rl(const bocpd_fast_t *b) {
+static inline size_t bocpd_simd_get_map_rl(const bocpd_simd_t *b) {
     return b->map_runlength;
-}
-
-/**
- * @brief Get current timestep
- */
-static inline size_t bocpd_fast_get_t(const bocpd_fast_t *b) {
-    return b->t;
 }
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* BOCPD_FAST_H */
+#endif /* BOCPD_SIMD_H */
