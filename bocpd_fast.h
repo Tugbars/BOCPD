@@ -1,10 +1,10 @@
 /**
- * @file bocpd_simd.h
- * @brief Fully optimized BOCPD with AVX2 SIMD
+ * @file bocpd_final.h
+ * @brief Production-grade BOCPD with correct AVX2 math
  */
 
-#ifndef BOCPD_SIMD_H
-#define BOCPD_SIMD_H
+#ifndef BOCPD_FINAL_H
+#define BOCPD_FINAL_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -18,62 +18,64 @@ typedef struct {
 } bocpd_prior_t;
 
 typedef struct {
-    /* Configuration */
+    /* Config */
     double hazard;
     double one_minus_h;
     double trunc_thresh;
     bocpd_prior_t prior;
 
-    /* Ring buffer state */
+    /* Capacity */
     size_t capacity;
     size_t active_len;
-    size_t ring_start;      /* Ring buffer head index */
+    size_t ring_start;  /* Ring buffer index */
 
-    /* Sufficient stats (ring buffer) */
+    /* Ring-buffered arrays (all indexed via ring) */
     double *ss_n;
     double *ss_sum;
     double *ss_sum2;
 
-    /* Incremental posterior params (ring buffer, updated incrementally) */
+    /* Incremental posteriors (ring-buffered) */
     double *post_kappa;
     double *post_mu;
     double *post_alpha;
     double *post_beta;
 
-    /* Precomputed per-run-length constants for Student-t */
-    double *C1;             /* lgamma terms + constant part */
-    double *C2;             /* (nu+1)/2 */
-    double *inv_sigma;      /* 1/sigma */
-    double *inv_nu;         /* 1/nu */
+    /* Incremental lgamma values (ring-buffered) */
+    double *lgamma_alpha;       /* lgamma(alpha) */
+    double *lgamma_alpha_p5;    /* lgamma(alpha + 0.5) */
 
-    /* Work arrays (no ring buffer, linear) */
-    double *pp;
+    /* Incremental log terms (ring-buffered) */
+    double *ln_sigma_sq;        /* ln(beta*(kappa+1)/(alpha*kappa)) */
+    double *ln_nu_pi;           /* ln(2*alpha*pi) */
+
+    /* Run-length distribution (linear, not ring) */
     double *r;
-    double *r_new;
-
-    /* lgamma cache */
-    double *lgamma_cache;
-    size_t lgamma_cache_size;
+    double *r_scratch;          /* Scratch buffer instead of alloca */
 
     /* Output */
     size_t t;
     size_t map_runlength;
     double p_changepoint;
-} bocpd_simd_t;
+} bocpd_final_t;
 
-int bocpd_simd_init(bocpd_simd_t *b, double hazard_lambda, 
-                    bocpd_prior_t prior, size_t max_run_length);
-void bocpd_simd_free(bocpd_simd_t *b);
-void bocpd_simd_reset(bocpd_simd_t *b);
-void bocpd_simd_step(bocpd_simd_t *b, double x);
-double bocpd_simd_change_prob(const bocpd_simd_t *b, size_t window);
+int bocpd_final_init(bocpd_final_t *b, double hazard_lambda,
+                     bocpd_prior_t prior, size_t max_run_length);
+void bocpd_final_free(bocpd_final_t *b);
+void bocpd_final_reset(bocpd_final_t *b);
+void bocpd_final_step(bocpd_final_t *b, double x);
 
-static inline size_t bocpd_simd_get_map_rl(const bocpd_simd_t *b) {
+static inline size_t bocpd_final_get_map_rl(const bocpd_final_t *b) {
     return b->map_runlength;
+}
+static inline double bocpd_final_change_prob(const bocpd_final_t *b, size_t w) {
+    double s = 0;
+    size_t m = (w < b->active_len) ? w : b->active_len;
+    for (size_t i = 0; i < m; i++) s += b->r[i];
+    return s;
 }
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* BOCPD_SIMD_H */
+#endif
