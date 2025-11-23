@@ -56,6 +56,8 @@ typedef struct {
     size_t t;
     size_t map_runlength;
     double p_changepoint;
+
+    double *sigma_sq;           /* beta*(kappa+1)/(alpha*kappa) - stored directly */
 } bocpd_final_t;
 
 int bocpd_final_init(bocpd_final_t *b, double hazard_lambda,
