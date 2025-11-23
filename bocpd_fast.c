@@ -29,7 +29,7 @@
  * - Overflow protection: exp input clamped to [-700, 700]
  */
 
-#include "bocpd_ultra.h"
+#include "bocpd_fast.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
