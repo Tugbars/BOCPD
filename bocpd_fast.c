@@ -185,7 +185,7 @@ static inline void ring_advance(bocpd_final_t *b) {
 static inline void update_posterior_incremental(
     double *kappa, double *mu, double *alpha, double *beta,
     double *lgamma_a, double *lgamma_a_p5,
-    double *ln_sigma_sq, double *ln_nu_pi,
+    double *ln_sigma_sq, double *ln_nu_pi, double *sigma_sq_out,
     double x,
     double kappa0, double mu0, double alpha0, double beta0)
 {
@@ -205,26 +205,21 @@ static inline void update_posterior_incremental(
     *alpha = alpha_new;
     *beta = beta_new;
 
-    /* 
-     * Incremental lgamma updates using recurrence:
-     * lgamma(a + 0.5) = lgamma(a) + ln(a)  [for a > 0]
-     * lgamma(a_new) = lgamma(a_old) + ln(a_old)
-     * lgamma(a_new + 0.5) = lgamma(a_old + 0.5) + ln(a_old + 0.5)
-     */
-    double lgamma_a_old = *lgamma_a;
-    double lgamma_a_p5_old = *lgamma_a_p5;
+    /* Incremental lgamma: lgamma(a_new) = lgamma(a_old) + ln(a_old) */
+    *lgamma_a = *lgamma_a + log(alpha_old);
+    *lgamma_a_p5 = *lgamma_a_p5 + log(alpha_old + 0.5);
 
-    *lgamma_a = lgamma_a_old + log(alpha_old);
-    *lgamma_a_p5 = lgamma_a_p5_old + log(alpha_old + 0.5);
+    /* Incremental ln_nu_pi: ln(2*alpha_new*pi) = ln(2*alpha_old*pi) + ln(alpha_new/alpha_old) */
+    /* Since alpha_new = alpha_old + 0.5: */
+    *ln_nu_pi = *ln_nu_pi + log((alpha_old + 0.5) / alpha_old);
 
-    /* 
-     * Incremental ln(sigma²) and ln(nu*pi)
-     * sigma² = beta * (kappa + 1) / (alpha * kappa)
-     * nu * pi = 2 * alpha * pi
-     */
-    *ln_sigma_sq = log(beta_new) + log(kappa_new + 1.0) - log(alpha_new) - log(kappa_new);
-    *ln_nu_pi = log(2.0 * alpha_new * M_PI);
+    /* Store sigma² directly (avoid exp in hot loop) */
+    double sigma_sq_new = beta_new * (kappa_new + 1.0) / (alpha_new * kappa_new);
+    *sigma_sq_out = sigma_sq_new;
+    *ln_sigma_sq = log(sigma_sq_new);
 }
+
+
 
 static inline void init_posterior_slot(
     bocpd_final_t *b, size_t ri,
@@ -236,7 +231,10 @@ static inline void init_posterior_slot(
     b->post_beta[ri] = beta0;
     b->lgamma_alpha[ri] = lgamma(alpha0);
     b->lgamma_alpha_p5[ri] = lgamma(alpha0 + 0.5);
-    b->ln_sigma_sq[ri] = log(beta0) + log(kappa0 + 1.0) - log(alpha0) - log(kappa0);
+
+    double sigma_sq = beta0 * (kappa0 + 1.0) / (alpha0 * kappa0);
+    b->sigma_sq[ri] = sigma_sq;
+    b->ln_sigma_sq[ri] = log(sigma_sq);
     b->ln_nu_pi[ri] = log(2.0 * alpha0 * M_PI);
 }
 
@@ -249,7 +247,6 @@ static void fused_step_backwards(bocpd_final_t *b, double x) {
     const double h = b->hazard;
     const double omh = b->one_minus_h;
     const double thresh = b->trunc_thresh;
-    const double x2 = x * x;
 
     double *r = b->r;
     double *r_new = b->r_scratch;
@@ -261,31 +258,19 @@ static void fused_step_backwards(bocpd_final_t *b, double x) {
 
     memset(r_new, 0, (n + 1) * sizeof(double));
 
-    /*
-     * Process backwards in blocks of 4 for SIMD
-     * This respects the BOCPD recurrence: r_new[k] = r[k-1] * pp * (1-h)
-     */
-    __m256d h_vec = _mm256_set1_pd(h);
-    __m256d omh_vec = _mm256_set1_pd(omh);
-    __m256d thresh_vec = _mm256_set1_pd(thresh);
-    __m256d x_vec = _mm256_set1_pd(x);
-    __m256d one = _mm256_set1_pd(1.0);
-    __m256d half = _mm256_set1_pd(0.5);
-    __m256d min_pp = _mm256_set1_pd(1e-300);
+    /* Hoist all constants outside loop */
+    const __m256d h_vec = _mm256_set1_pd(h);
+    const __m256d omh_vec = _mm256_set1_pd(omh);
+    const __m256d thresh_vec = _mm256_set1_pd(thresh);
+    const __m256d x_vec = _mm256_set1_pd(x);
+    const __m256d one = _mm256_set1_pd(1.0);
+    const __m256d half = _mm256_set1_pd(0.5);
+    const __m256d min_pp = _mm256_set1_pd(1e-300);
     __m256d r0_acc = _mm256_setzero_pd();
 
-    /* Process backwards: i = n-1, n-2, ..., 0 */
-    /* In blocks of 4: start from highest multiple of 4 <= n-1 */
     size_t i = (n >= 4) ? ((n - 1) & ~3ULL) : 0;
 
-    /* SIMD blocks (backwards) */
     for (; i + 4 <= n && i < n; ) {
-        /* 
-         * Load 4 consecutive run lengths starting at i
-         * We're computing r_new[i+1..i+4] from r[i..i+3]
-         */
-        
-        /* Gather from ring buffer (4 loads, unfortunately) */
         size_t ri0 = ring_idx(b, i);
         size_t ri1 = ring_idx(b, i + 1);
         size_t ri2 = ring_idx(b, i + 2);
@@ -293,7 +278,10 @@ static void fused_step_backwards(bocpd_final_t *b, double x) {
 
         __m256d r_old = _mm256_set_pd(r[i+3], r[i+2], r[i+1], r[i]);
 
-        /* Load precomputed ln terms (no recomputation!) */
+        /* Load precomputed values (no exp needed for sigma_sq!) */
+        __m256d sigma_sq = _mm256_set_pd(
+            b->sigma_sq[ri3], b->sigma_sq[ri2],
+            b->sigma_sq[ri1], b->sigma_sq[ri0]);
         __m256d ln_sigma_sq = _mm256_set_pd(
             b->ln_sigma_sq[ri3], b->ln_sigma_sq[ri2],
             b->ln_sigma_sq[ri1], b->ln_sigma_sq[ri0]);
@@ -316,17 +304,9 @@ static void fused_step_backwards(bocpd_final_t *b, double x) {
         /* nu = 2 * alpha */
         __m256d nu = _mm256_add_pd(post_alpha, post_alpha);
 
-        /* z² / sigma² = (x - mu)² / sigma² = (x - mu)² * exp(-ln_sigma_sq) */
-        /* But simpler: z²/sigma² = (x-mu)² / sigma² */
-        /* We have ln(sigma²), so: z²/sigma² = (x-mu)² * exp(-ln_sigma_sq) */
-        /* Actually easier: compute (x-mu)², then divide by sigma² via exp */
+        /* z² / (sigma² * nu) — no exp needed! */
         __m256d x_minus_mu = _mm256_sub_pd(x_vec, post_mu);
         __m256d x_minus_mu_sq = _mm256_mul_pd(x_minus_mu, x_minus_mu);
-
-        /* sigma² = exp(ln_sigma_sq) */
-        __m256d sigma_sq = avx2_exp_fast(ln_sigma_sq);
-
-        /* z² / nu = (x-mu)² / (sigma² * nu) */
         __m256d sigma_sq_nu = _mm256_mul_pd(sigma_sq, nu);
         __m256d z2_over_nu = _mm256_div_pd(x_minus_mu_sq, sigma_sq_nu);
 
@@ -334,37 +314,25 @@ static void fused_step_backwards(bocpd_final_t *b, double x) {
         __m256d term = _mm256_add_pd(one, z2_over_nu);
         __m256d ln_term = avx2_log_fast(term);
 
-        /* (nu + 1) / 2 */
-        __m256d nu_plus_1_half = _mm256_fmadd_pd(post_alpha, one, half);
+        /* (nu + 1) / 2 = alpha + 0.5 */
+        __m256d nu_plus_1_half = _mm256_add_pd(post_alpha, half);
 
-        /* 
-         * ln_pp = lgamma(alpha + 0.5) - lgamma(alpha) 
-         *       - 0.5 * ln(nu * pi) - 0.5 * ln(sigma²)
-         *       - (nu+1)/2 * ln(1 + z²/nu)
-         */
+        /* ln_pp = lgamma(a+0.5) - lgamma(a) - 0.5*ln(nu*pi) - 0.5*ln(sigma²) - (nu+1)/2*ln(1+z²/nu) */
         __m256d ln_pp = _mm256_sub_pd(lgamma_a_p5, lgamma_a);
         ln_pp = _mm256_fnmadd_pd(half, ln_nu_pi, ln_pp);
         ln_pp = _mm256_fnmadd_pd(half, ln_sigma_sq, ln_pp);
         ln_pp = _mm256_fnmadd_pd(nu_plus_1_half, ln_term, ln_pp);
 
-        /* pp = exp(ln_pp) */
         __m256d pp = avx2_exp_fast(ln_pp);
         pp = _mm256_max_pd(pp, min_pp);
 
-        /* r_pp = r_old * pp */
         __m256d r_pp = _mm256_mul_pd(r_old, pp);
-
-        /* growth = r_pp * (1-h), change = r_pp * h */
         __m256d growth = _mm256_mul_pd(r_pp, omh_vec);
         __m256d change = _mm256_mul_pd(r_pp, h_vec);
 
-        /* Store growth at r_new[i+1..i+4] */
         _mm256_storeu_pd(&r_new[i + 1], growth);
-
-        /* Accumulate changepoint */
         r0_acc = _mm256_add_pd(r0_acc, change);
 
-        /* Track last_valid */
         __m256d cmp = _mm256_cmp_pd(growth, thresh_vec, _CMP_GT_OQ);
         int mask = _mm256_movemask_pd(cmp);
         if (mask) {
@@ -379,36 +347,32 @@ static void fused_step_backwards(bocpd_final_t *b, double x) {
         i -= 4;
     }
 
-    /* Horizontal sum r0_acc */
+    /* Horizontal sum */
     __m128d lo = _mm256_castpd256_pd128(r0_acc);
     __m128d hi = _mm256_extractf128_pd(r0_acc, 1);
     lo = _mm_add_pd(lo, hi);
-    __m128d shuf = _mm_shuffle_pd(lo, lo, 1);
-    lo = _mm_add_pd(lo, shuf);
+    lo = _mm_add_pd(lo, _mm_shuffle_pd(lo, lo, 1));
     r0 = _mm_cvtsd_f64(lo);
 
-    /* Scalar remainder (handle indices not covered by SIMD) */
+    /* Scalar remainder */
     for (size_t j = 0; j < n && j <= i + 3; j++) {
-        if (r_new[j + 1] != 0.0) continue;  /* Already computed by SIMD */
+        if (r_new[j + 1] != 0.0) continue;
 
         double r_old_j = r[j];
-        if (r_old_j < 1e-300) {
-            r_new[j + 1] = 0.0;
-            continue;
-        }
+        if (r_old_j < 1e-300) continue;
 
         size_t ri = ring_idx(b, j);
 
         double post_mu_j = b->post_mu[ri];
         double post_alpha_j = b->post_alpha[ri];
+        double sigma_sq_j = b->sigma_sq[ri];      /* Direct load, no exp */
         double ln_sigma_sq_j = b->ln_sigma_sq[ri];
         double ln_nu_pi_j = b->ln_nu_pi[ri];
         double lgamma_a_j = b->lgamma_alpha[ri];
         double lgamma_a_p5_j = b->lgamma_alpha_p5[ri];
 
         double nu = 2.0 * post_alpha_j;
-        double sigma_sq = exp(ln_sigma_sq_j);
-        double z2_over_nu = (x - post_mu_j) * (x - post_mu_j) / (sigma_sq * nu);
+        double z2_over_nu = (x - post_mu_j) * (x - post_mu_j) / (sigma_sq_j * nu);
 
         double ln_pp = lgamma_a_p5_j - lgamma_a_j
                      - 0.5 * ln_nu_pi_j - 0.5 * ln_sigma_sq_j
@@ -421,31 +385,23 @@ static void fused_step_backwards(bocpd_final_t *b, double x) {
         r_new[j + 1] = r_pp * omh;
         r0 += r_pp * h;
 
-        if (r_new[j + 1] > thresh && j + 1 > last_valid) {
-            last_valid = j + 1;
-        }
+        if (r_new[j + 1] > thresh && j + 1 > last_valid) last_valid = j + 1;
     }
 
     r_new[0] = r0;
 
-    /* Normalize + find MAP */
     size_t new_len = (last_valid > 0) ? last_valid + 1 : n + 1;
     if (new_len > b->capacity - 1) new_len = b->capacity - 1;
 
     double r_sum = 0.0;
     for (size_t j = 0; j < new_len; j++) {
         r_sum += r_new[j];
-        if (r_new[j] > map_val) {
-            map_val = r_new[j];
-            map_idx = j;
-        }
+        if (r_new[j] > map_val) { map_val = r_new[j]; map_idx = j; }
     }
 
     if (r_sum > 1e-300) {
         double inv_sum = 1.0 / r_sum;
-        for (size_t j = 0; j < new_len; j++) {
-            r[j] = r_new[j] * inv_sum;
-        }
+        for (size_t j = 0; j < new_len; j++) r[j] = r_new[j] * inv_sum;
     }
 
     b->active_len = new_len;
@@ -459,32 +415,27 @@ static void fused_step_backwards(bocpd_final_t *b, double x) {
 static void shift_and_observe(bocpd_final_t *b, double x) {
     const size_t n = b->active_len;
 
-    /* O(1) shift: just move ring_start */
     ring_advance(b);
     size_t new_slot = ring_idx(b, 0);
 
-    /* Initialize new slot with prior */
     init_posterior_slot(b, new_slot,
         b->prior.kappa0, b->prior.mu0, b->prior.alpha0, b->prior.beta0);
     b->ss_n[new_slot] = 0.0;
     b->ss_sum[new_slot] = 0.0;
     b->ss_sum2[new_slot] = 0.0;
 
-    /* O(active_len): observe x in all slots, update posteriors incrementally */
     for (size_t i = 0; i < n; i++) {
         size_t ri = ring_idx(b, i);
 
-        /* Update SS */
         b->ss_n[ri] += 1.0;
         b->ss_sum[ri] += x;
         b->ss_sum2[ri] += x * x;
 
-        /* Incremental posterior update */
         update_posterior_incremental(
             &b->post_kappa[ri], &b->post_mu[ri],
             &b->post_alpha[ri], &b->post_beta[ri],
             &b->lgamma_alpha[ri], &b->lgamma_alpha_p5[ri],
-            &b->ln_sigma_sq[ri], &b->ln_nu_pi[ri],
+            &b->ln_sigma_sq[ri], &b->ln_nu_pi[ri], &b->sigma_sq[ri],
             x,
             b->prior.kappa0, b->prior.mu0, b->prior.alpha0, b->prior.beta0);
     }
@@ -526,10 +477,11 @@ int bocpd_final_init(bocpd_final_t *b, double hazard_lambda,
     b->ln_nu_pi = aligned_alloc(64, alloc);
     b->r = aligned_alloc(64, alloc);
     b->r_scratch = aligned_alloc(64, alloc);
+    b->sigma_sq = aligned_alloc(64, alloc);
 
     if (!b->ss_n || !b->ss_sum || !b->ss_sum2 || !b->post_kappa ||
         !b->post_mu || !b->post_alpha || !b->post_beta ||
-        !b->lgamma_alpha || !b->lgamma_alpha_p5 ||
+        !b->lgamma_alpha || !b->lgamma_alpha_p5 || || !b->sigma_sq
         !b->ln_sigma_sq || !b->ln_nu_pi || !b->r || !b->r_scratch) {
         bocpd_final_free(b);
         return -1;
@@ -551,6 +503,8 @@ void bocpd_final_free(bocpd_final_t *b) {
     free(b->lgamma_alpha); free(b->lgamma_alpha_p5);
     free(b->ln_sigma_sq); free(b->ln_nu_pi);
     free(b->r); free(b->r_scratch);
+    /* In bocpd_final_free, add: */
+    free(b->sigma_sq);
     memset(b, 0, sizeof(*b));
 }
 
