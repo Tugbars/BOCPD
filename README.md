@@ -1,6 +1,6 @@
 # BOCPD Ultra
 
-**Ultra-optimized Bayesian Online Change Point Detection for High-Frequency Trading**
+**Optimized Bayesian Online Change Point Detection for High-Frequency Trading**
 
 A production-grade C implementation of the Adams & MacKay (2007) BOCPD algorithm, heavily optimized with AVX2 SIMD for sub-microsecond latency per observation.
 
