@@ -480,6 +480,24 @@ static inline double bocpd_ultra_change_prob(const bocpd_ultra_t *b, size_t w) {
     return s;
 }
 
+#ifdef BOCPD_USE_AVX512
+/* External AVX-512 assembly kernel */
+extern void bocpd_kernel_avx512(
+    double *r,
+    double *r_new,
+    const double *mu,
+    const double *C1,
+    const double *C2,
+    const double *inv_ssn,
+    size_t n_padded,
+    double x,
+    double h,
+    double omh,
+    double thresh,
+    double *change_out
+);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
