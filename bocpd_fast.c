@@ -481,7 +481,7 @@ int bocpd_final_init(bocpd_final_t *b, double hazard_lambda,
 
     if (!b->ss_n || !b->ss_sum || !b->ss_sum2 || !b->post_kappa ||
         !b->post_mu || !b->post_alpha || !b->post_beta ||
-        !b->lgamma_alpha || !b->lgamma_alpha_p5 || || !b->sigma_sq
+        !b->lgamma_alpha || !b->lgamma_alpha_p5 || !b->sigma_sq
         !b->ln_sigma_sq || !b->ln_nu_pi || !b->r || !b->r_scratch) {
         bocpd_final_free(b);
         return -1;
@@ -542,6 +542,7 @@ void bocpd_final_step(bocpd_final_t *b, double x) {
         b->lgamma_alpha_p5[ri] = lgamma(alpha_new + 0.5);
         b->ln_sigma_sq[ri] = log(beta_new) + log(kappa_new + 1.0) - log(alpha_new) - log(kappa_new);
         b->ln_nu_pi[ri] = log(2.0 * alpha_new * M_PI);
+        b->sigma_sq[ri] = beta_new * (kappa_new + 1.0) / (alpha_new * kappa_new);
 
         b->active_len = 1;
         b->t = 1;
