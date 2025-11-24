@@ -1,4 +1,3 @@
-
 ;==============================================================================
 ; BOCPD Ultra-Optimized AVX2 Kernel - CORRECTED VERSION
 ;
@@ -243,14 +242,43 @@ bocpd_kernel_avx2:
     vroundpd    ymm6, ymm5, 0                       ; k = round(t)
     vsubpd      ymm5, ymm5, ymm6                    ; f = t - k
     
-    ; 2^f via polynomial (Horner)
-    vmovapd     ymm7, [rel exp_c6]
-    vfmadd213pd ymm7, ymm5, [rel exp_c5]
-    vfmadd213pd ymm7, ymm5, [rel exp_c4]
-    vfmadd213pd ymm7, ymm5, [rel exp_c3]
-    vfmadd213pd ymm7, ymm5, [rel exp_c2]
-    vfmadd213pd ymm7, ymm5, [rel exp_c1]
-    vfmadd213pd ymm7, ymm5, [rel const_one]         ; 2^f ≈ poly result
+    ; 2^f via ESTRIN'S SCHEME (reduced dependency depth)
+    ;
+    ; Level 1 (parallel - 3 independent FMAs):
+    ;   p01 = 1 + f*c1
+    ;   p23 = c2 + f*c3
+    ;   p45 = c4 + f*c5
+    ;
+    ; Level 2:
+    ;   f2 = f*f
+    ;   q0123 = p01 + f2*p23
+    ;   q456 = p45 + f2*c6
+    ;
+    ; Level 3:
+    ;   f4 = f2*f2
+    ;   result = q0123 + f4*q456
+    ;
+    ; Dependency depth: 4 FMAs instead of 7 (Horner)
+    
+    ; Level 1: compute p01, p23, p45 in parallel
+    vmovapd     ymm7, [rel const_one]
+    vfmadd231pd ymm7, ymm5, [rel exp_c1]            ; p01 = 1 + f*c1
+    
+    vmovapd     ymm0, [rel exp_c2]
+    vfmadd231pd ymm0, ymm5, [rel exp_c3]            ; p23 = c2 + f*c3
+    
+    vmovapd     ymm1, [rel exp_c4]
+    vfmadd231pd ymm1, ymm5, [rel exp_c5]            ; p45 = c4 + f*c5
+    
+    ; Level 2: f2, then combine pairs
+    vmulpd      ymm2, ymm5, ymm5                    ; f2 = f*f
+    vfmadd231pd ymm7, ymm2, ymm0                    ; q0123 = p01 + f2*p23
+    vfmadd231pd ymm1, ymm2, [rel exp_c6]            ; q456 = p45 + f2*c6
+    
+    ; Level 3: f4, then final result
+    vmulpd      ymm2, ymm2, ymm2                    ; f4 = f2*f2
+    vfmadd231pd ymm7, ymm2, ymm1                    ; result = q0123 + f4*q456
+    ; ymm7 now contains 2^f
     
     ;--------------------------------------------------------------------------
     ; CORRECT 2^k reconstruction (IEEE-754 compliant)
@@ -380,14 +408,27 @@ bocpd_kernel_avx2:
     vroundpd    ymm6, ymm5, 0
     vsubpd      ymm5, ymm5, ymm6
     
-    ; 2^f polynomial
-    vmovapd     ymm7, [rel exp_c6]
-    vfmadd213pd ymm7, ymm5, [rel exp_c5]
-    vfmadd213pd ymm7, ymm5, [rel exp_c4]
-    vfmadd213pd ymm7, ymm5, [rel exp_c3]
-    vfmadd213pd ymm7, ymm5, [rel exp_c2]
-    vfmadd213pd ymm7, ymm5, [rel exp_c1]
-    vfmadd213pd ymm7, ymm5, [rel const_one]
+    ; 2^f via ESTRIN'S SCHEME for Block B
+    ; (Same structure as Block A - reduced dependency depth)
+    
+    ; Level 1: p01, p23, p45 in parallel
+    vmovapd     ymm7, [rel const_one]
+    vfmadd231pd ymm7, ymm5, [rel exp_c1]            ; p01 = 1 + f*c1
+    
+    vmovapd     ymm0, [rel exp_c2]
+    vfmadd231pd ymm0, ymm5, [rel exp_c3]            ; p23 = c2 + f*c3
+    
+    vmovapd     ymm1, [rel exp_c4]
+    vfmadd231pd ymm1, ymm5, [rel exp_c5]            ; p45 = c4 + f*c5
+    
+    ; Level 2: f2, combine pairs
+    vmulpd      ymm2, ymm5, ymm5                    ; f2 = f*f
+    vfmadd231pd ymm7, ymm2, ymm0                    ; q0123 = p01 + f2*p23
+    vfmadd231pd ymm1, ymm2, [rel exp_c6]            ; q456 = p45 + f2*c6
+    
+    ; Level 3: f4, final result
+    vmulpd      ymm2, ymm2, ymm2                    ; f4 = f2*f2
+    vfmadd231pd ymm7, ymm2, ymm1                    ; result = q0123 + f4*q456
     
     ; CORRECT 2^k reconstruction for block B
     vcvtpd2dq   xmm0, ymm6
