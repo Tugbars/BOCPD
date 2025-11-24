@@ -5,7 +5,9 @@
  * Measures throughput in observations/second for various scenarios.
  */
 
+#ifndef _WIN32
 #define _POSIX_C_SOURCE 199309L
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,18 +19,29 @@
 #define M_PI 3.14159265358979323846264338327950288
 #endif
 
-#include "bocpd_fast.h"
+#include "bocpd_asm.h"
 
 /*==============================================================================
  * Timing utilities
  *==============================================================================*/
 
+#ifdef _WIN32
+#include <windows.h>
+static inline double get_time_sec(void)
+{
+    LARGE_INTEGER freq, count;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&count);
+    return (double)count.QuadPart / (double)freq.QuadPart;
+}
+#else
 static inline double get_time_sec(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
+#endif
 
 /*==============================================================================
  * Random number generation
@@ -60,7 +73,7 @@ static inline double fast_rand_normal(void)
  */
 static double bench_stationary(size_t n_obs, size_t max_run)
 {
-    bocpd_ultra_t b;
+    bocpd_asm_t  b;
     bocpd_prior_t prior = {
         .mu0 = 0.0,
         .kappa0 = 1.0,
@@ -98,7 +111,7 @@ static double bench_stationary(size_t n_obs, size_t max_run)
  */
 static double bench_changepoints(size_t n_obs, size_t max_run, size_t cp_interval)
 {
-    bocpd_ultra_t b;
+    bocpd_asm_t  b;
     bocpd_prior_t prior = {
         .mu0 = 0.0,
         .kappa0 = 0.1,
@@ -152,7 +165,7 @@ static void bench_scaling(void)
     {
         size_t max_run = max_runs[s];
         
-        bocpd_ultra_t b;
+        bocpd_asm_t  b;
         bocpd_prior_t prior = {
             .mu0 = 0.0,
             .kappa0 = 1.0,

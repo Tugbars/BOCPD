@@ -555,8 +555,8 @@ static void fused_step_simd(bocpd_asm_t *b, double x)
             .r_old = r,
             .x = x,
             .h = h,
-            .omh = omh,
-            .thresh = thresh,
+            .one_minus_h = omh,
+            .trunc_thresh = thresh,
             .n_padded = n_padded,
             .r_new = r_new,
             .r0_out = &r0_result,
@@ -1276,23 +1276,22 @@ void bocpd_ultra_free(bocpd_asm_t *b)
     if (!b)
         return;
 
-    free(b->ss_n);
-    free(b->ss_sum);
-    free(b->ss_sum2);
-    free(b->post_kappa);
-    free(b->post_mu);
-    free(b->post_alpha);
-    free(b->post_beta);
-    free(b->C1);
-    free(b->C2);
-    free(b->sigma_sq);
-    free(b->inv_sigma_sq_nu);
-    free(b->lgamma_alpha);
-    free(b->lgamma_alpha_p5);
-    free(b->lin_interleaved);
-    /* Legacy pointers are NULL, no need to free */
-    free(b->r);
-    free(b->r_scratch);
+    aligned_free(b->ss_n);
+    aligned_free(b->ss_sum);
+    aligned_free(b->ss_sum2);
+    aligned_free(b->post_kappa);
+    aligned_free(b->post_mu);
+    aligned_free(b->post_alpha);
+    aligned_free(b->post_beta);
+    aligned_free(b->C1);
+    aligned_free(b->C2);
+    aligned_free(b->sigma_sq);
+    aligned_free(b->inv_sigma_sq_nu);
+    aligned_free(b->lgamma_alpha);
+    aligned_free(b->lgamma_alpha_p5);
+    aligned_free(b->lin_interleaved);
+    aligned_free(b->r);
+    aligned_free(b->r_scratch);
 
     memset(b, 0, sizeof(*b));
 }

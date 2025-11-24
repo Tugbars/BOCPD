@@ -45,11 +45,19 @@ extern "C" {
  * Set via compile flag: -DBOCPD_KERNEL_VARIANT=1
  *=============================================================================*/
 
-#define BOCPD_KERNEL_GENERIC    0
-#define BOCPD_KERNEL_INTEL      1
+#define BOCPD_KERNEL_GENERIC    1
+#define BOCPD_KERNEL_INTEL      0
 
 #ifndef BOCPD_KERNEL_VARIANT
     #define BOCPD_KERNEL_VARIANT BOCPD_KERNEL_GENERIC
+#endif
+
+#ifdef _WIN32
+#include <malloc.h>
+#define aligned_alloc(align, size) _aligned_malloc((size), (align))
+#define aligned_free(ptr) _aligned_free(ptr)
+#else
+#define aligned_free(ptr) free(ptr)
 #endif
 
 /*=============================================================================
