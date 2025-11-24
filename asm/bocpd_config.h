@@ -3,27 +3,50 @@
  * @brief Build configuration for BOCPD implementation
  *
  * @details Controls compile-time switches for optimization paths.
- * Use -DBOCPD_USE_ASM=1 to enable hand-optimized assembly kernels.
+ *
+ * Build options:
+ *   -DBOCPD_USE_ASM=1           Enable assembly kernels
+ *   -DBOCPD_KERNEL_VARIANT=X    Select kernel variant (see below)
  */
 
 #ifndef BOCPD_CONFIG_H
 #define BOCPD_CONFIG_H
 
+#include <stddef.h>
+#include <stdint.h>
+
 /*=============================================================================
- * Assembly Kernel Configuration
+ * Kernel Variant Selection
  *
- * When enabled, the hot loop in fused_step_simd() is replaced with
- * hand-optimized AVX2 assembly that provides better instruction scheduling
- * and register allocation than compiler-generated code.
+ * BOCPD_KERNEL_GENERIC (0):
+ *   - Conservative scheduling, works well on all x86-64
+ *   - Aligned loads preferred
+ *   - Minimal register pressure
+ *   - Best for: AMD Zen1-3, older Intel, unknown targets
  *
- * Requirements:
- *   - x86-64 architecture
- *   - AVX2 + FMA support
- *   - NASM assembler (for building .asm files)
+ * BOCPD_KERNEL_INTEL_PERF (1):
+ *   - Aggressive ILP with interleaved A/B blocks
+ *   - Unaligned loads (no penalty on Skylake+)
+ *   - Tuned for Golden Cove / Raptor Cove microarchitecture
+ *   - Best for: Intel 12th-14th gen (Alder Lake, Raptor Lake)
  *
- * Build:
- *   gcc -DBOCPD_USE_ASM=1 -O3 -mavx2 -mfma bocpd_ultra_opt.c bocpd_kernel_avx2.o
- *   nasm -f elf64 bocpd_kernel_avx2.asm -o bocpd_kernel_avx2.o
+ * BOCPD_KERNEL_ZEN4 (2):  [Future - not yet implemented]
+ *   - Tuned for AMD Zen4 (dual 256-bit FMA pipes)
+ *   - Best for: AMD Ryzen 7000 series
+ *
+ *=============================================================================*/
+
+#define BOCPD_KERNEL_GENERIC      0
+#define BOCPD_KERNEL_INTEL_PERF   1
+#define BOCPD_KERNEL_ZEN4         2  /* Reserved for future */
+
+/* Default to generic if not specified */
+#ifndef BOCPD_KERNEL_VARIANT
+    #define BOCPD_KERNEL_VARIANT BOCPD_KERNEL_GENERIC
+#endif
+
+/*=============================================================================
+ * Assembly Kernel Enable/Disable
  *=============================================================================*/
 
 #ifndef BOCPD_USE_ASM
@@ -48,6 +71,15 @@
     #endif
 #endif
 
+/* Validate kernel variant */
+#if BOCPD_USE_ASM
+    #if BOCPD_KERNEL_VARIANT == BOCPD_KERNEL_ZEN4
+        #warning "Zen4 kernel not yet implemented, falling back to generic"
+        #undef BOCPD_KERNEL_VARIANT
+        #define BOCPD_KERNEL_VARIANT BOCPD_KERNEL_GENERIC
+    #endif
+#endif
+
 /*=============================================================================
  * Kernel Arguments Structure
  *
@@ -57,15 +89,12 @@
  * Memory layout is critical for assembly - do not reorder fields!
  *=============================================================================*/
 
-#include <stddef.h>
-#include <stdint.h>
-
 /**
  * @brief Arguments for the fused SIMD kernel.
  *
  * @note Field order matches assembly expectations. Do not reorder!
  * @note All pointers must be 64-byte aligned for optimal performance.
- * @note V2: Uses interleaved layout for better cache utilization.
+ * @note Uses interleaved layout for better cache utilization.
  */
 typedef struct bocpd_kernel_args {
     /*=========================================================================
@@ -99,26 +128,58 @@ typedef struct bocpd_kernel_args {
 } bocpd_kernel_args_t;
 
 /*=============================================================================
- * Assembly Kernel Declaration
+ * Assembly Kernel Declarations
  *=============================================================================*/
 
 #if BOCPD_USE_ASM
+
 /**
- * @brief Hand-optimized AVX2 implementation of the fused BOCPD kernel.
+ * @brief Generic AVX2 kernel - works well on all x86-64 with AVX2+FMA
  *
- * @param args Pointer to kernel arguments structure
- *
- * @pre All input arrays must be 64-byte aligned
- * @pre args->n_padded must be a multiple of 8
- *
- * @post args->r_new contains unnormalized growth probabilities
- * @post args->r0_out contains accumulated changepoint probability
- * @post args->max_growth_out and args->max_idx_out contain MAP information
- * @post args->last_valid_out contains truncation boundary
- *
- * @note Implemented in bocpd_kernel_avx2.asm
+ * Conservative scheduling, aligned loads, minimal assumptions.
+ * Implemented in bocpd_kernel_avx2_generic.asm
  */
-extern void bocpd_fused_loop_avx2(bocpd_kernel_args_t *args);
+extern void bocpd_fused_loop_avx2_generic(bocpd_kernel_args_t *args);
+
+/**
+ * @brief Intel-tuned AVX2 kernel - optimized for Alder Lake / Raptor Lake
+ *
+ * Aggressive ILP, interleaved A/B scheduling, unaligned loads.
+ * Implemented in bocpd_kernel_avx2_intel.asm
+ */
+extern void bocpd_fused_loop_avx2_intel(bocpd_kernel_args_t *args);
+
+/**
+ * @brief Dispatch macro - selects kernel based on BOCPD_KERNEL_VARIANT
+ */
+#if BOCPD_KERNEL_VARIANT == BOCPD_KERNEL_INTEL_PERF
+    #define bocpd_fused_loop_avx2(args) bocpd_fused_loop_avx2_intel(args)
+#else
+    #define bocpd_fused_loop_avx2(args) bocpd_fused_loop_avx2_generic(args)
 #endif
+
+#endif /* BOCPD_USE_ASM */
+
+/*=============================================================================
+ * Build Instructions
+ *=============================================================================
+ *
+ * Generic kernel (default, works everywhere):
+ *   nasm -f elf64 -o bocpd_kernel_generic.o bocpd_kernel_avx2_generic.asm
+ *   gcc -DBOCPD_USE_ASM=1 -O3 -mavx2 -mfma -c bocpd_ultra_opt.c
+ *   ar rcs libbocpd.a bocpd_ultra_opt.o bocpd_kernel_generic.o
+ *
+ * Intel-optimized kernel:
+ *   nasm -f elf64 -o bocpd_kernel_intel.o bocpd_kernel_avx2_intel.asm
+ *   gcc -DBOCPD_USE_ASM=1 -DBOCPD_KERNEL_VARIANT=1 -O3 -mavx2 -mfma -c bocpd_ultra_opt.c
+ *   ar rcs libbocpd.a bocpd_ultra_opt.o bocpd_kernel_intel.o
+ *
+ * Both kernels (runtime selection possible with wrapper):
+ *   nasm -f elf64 -o bocpd_kernel_generic.o bocpd_kernel_avx2_generic.asm
+ *   nasm -f elf64 -o bocpd_kernel_intel.o bocpd_kernel_avx2_intel.asm
+ *   gcc -DBOCPD_USE_ASM=1 -O3 -mavx2 -mfma -c bocpd_ultra_opt.c
+ *   ar rcs libbocpd.a bocpd_ultra_opt.o bocpd_kernel_generic.o bocpd_kernel_intel.o
+ *
+ *=============================================================================*/
 
 #endif /* BOCPD_CONFIG_H */
