@@ -65,38 +65,36 @@
  *
  * @note Field order matches assembly expectations. Do not reorder!
  * @note All pointers must be 64-byte aligned for optimal performance.
+ * @note V2: Uses interleaved layout for better cache utilization.
  */
 typedef struct bocpd_kernel_args {
     /*=========================================================================
-     * Input arrays (read-only) - offsets 0-39
+     * Input arrays (read-only) - INTERLEAVED LAYOUT
      *=========================================================================*/
-    const double *lin_mu;       /**< [0]  Linearized posterior means */
-    const double *lin_C1;       /**< [8]  Linearized Student-t C1 constants */
-    const double *lin_C2;       /**< [16] Linearized Student-t C2 constants */
-    const double *lin_inv_ssn;  /**< [24] Linearized 1/(σ²ν) values */
-    const double *r_old;        /**< [32] Current run-length distribution */
+    const double *lin_interleaved; /**< [0]  Interleaved [mu×4,C1×4,C2×4,inv_ssn×4] blocks */
+    const double *r_old;           /**< [8]  Current run-length distribution */
 
     /*=========================================================================
-     * Scalar inputs - offsets 40-79
+     * Scalar inputs - offsets 16-55
      *=========================================================================*/
-    double x;                   /**< [40] New observation */
-    double h;                   /**< [48] Hazard rate */
-    double omh;                 /**< [56] 1 - hazard rate */
-    double thresh;              /**< [64] Truncation threshold */
-    size_t n_padded;            /**< [72] Padded array length (multiple of 8) */
+    double x;                   /**< [16] New observation */
+    double h;                   /**< [24] Hazard rate */
+    double omh;                 /**< [32] 1 - hazard rate */
+    double thresh;              /**< [40] Truncation threshold */
+    size_t n_padded;            /**< [48] Padded array length (multiple of 8) */
 
     /*=========================================================================
-     * Output array - offset 80
+     * Output array - offset 56
      *=========================================================================*/
-    double *r_new;              /**< [80] Output run-length distribution */
+    double *r_new;              /**< [56] Output run-length distribution */
 
     /*=========================================================================
-     * Scalar outputs - offsets 88-119 (pointers for assembly to write to)
+     * Scalar outputs - offsets 64-95 (pointers for assembly to write to)
      *=========================================================================*/
-    double *r0_out;             /**< [88]  Pointer to accumulated changepoint probability */
-    double *max_growth_out;     /**< [96]  Pointer to maximum growth value (for MAP) */
-    size_t *max_idx_out;        /**< [104] Pointer to index of maximum growth (for MAP) */
-    size_t *last_valid_out;     /**< [112] Pointer to last index above threshold */
+    double *r0_out;             /**< [64]  Pointer to accumulated changepoint probability */
+    double *max_growth_out;     /**< [72]  Pointer to maximum growth value (for MAP) */
+    size_t *max_idx_out;        /**< [80]  Pointer to index of maximum growth (for MAP) */
+    size_t *last_valid_out;     /**< [88]  Pointer to last index above threshold */
 
 } bocpd_kernel_args_t;
 
