@@ -15,7 +15,7 @@
  * 5. Inlined log1p/exp polynomials for better ILP across blocks
  * 6. Fast scalar log() for posterior updates (~4x faster than libm)
  *
- * ### Take 2: Polynomial Optimizations  
+ * ### Take 2: Polynomial Optimizations
  * 7. Estrin's scheme for exp() polynomial - reduces dependency depth
  *    from 6 sequential FMAs to 4, better utilizing dual FMA units
  *
@@ -51,8 +51,7 @@
 #define M_PI 3.14159265358979323846264338327950288
 #endif
 
-#include "bocpd_fast.h"
-#include "bocpd_config.h"
+#include "bocpd_asm.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -99,7 +98,7 @@ static const double LN_PI = 1.1447298858494001741434273513530587;
  *
  * @note Uses bitwise AND instead of modulo (faster when capacity is power of 2).
  */
-static inline size_t ring_idx(const bocpd_ultra_t *b, size_t i)
+static inline size_t ring_idx(const bocpd_asm_t *b, size_t i)
 {
     return (b->ring_start + i) & (b->capacity - 1);
 }
@@ -114,7 +113,7 @@ static inline size_t ring_idx(const bocpd_ultra_t *b, size_t i)
  *
  * @note This is O(1) - no data movement required.
  */
-static inline void ring_advance(bocpd_ultra_t *b)
+static inline void ring_advance(bocpd_asm_t *b)
 {
     b->ring_start = (b->ring_start + b->capacity - 1) & (b->capacity - 1);
 }
@@ -149,7 +148,7 @@ static inline void ring_advance(bocpd_ultra_t *b)
  *       [mu[i..i+3], C1[i..i+3], C2[i..i+3], inv_ssn[i..i+3]]
  *       This is 128 bytes = 2 cache lines, optimal for streaming.
  */
-static void linearize_ring(bocpd_ultra_t *b)
+static void linearize_ring(bocpd_asm_t *b)
 {
     const size_t n = b->active_len;
     const size_t cap = b->capacity;
@@ -169,33 +168,33 @@ static void linearize_ring(bocpd_ultra_t *b)
      * 2. After wraparound (wraps around to start of ring)
      * 3. Padding region (fill with safe values)
      */
-    
+
     size_t i = 0;
-    
+
     /* Region 1: Before wraparound - can use contiguous loads */
     size_t region1_end = (n <= end) ? n : end;
     region1_end = (region1_end / 4) * 4; /* Round down to block boundary */
-    
+
     for (; i < region1_end; i += 4)
     {
         size_t ri = start + i;
         size_t block = i / 4;
         size_t base = block * 16;
-        
+
         /* Direct 4-element copies (compiler will vectorize) */
         memcpy(&out[base + 0], &b->post_mu[ri], 4 * sizeof(double));
         memcpy(&out[base + 4], &b->C1[ri], 4 * sizeof(double));
         memcpy(&out[base + 8], &b->C2[ri], 4 * sizeof(double));
         memcpy(&out[base + 12], &b->inv_sigma_sq_nu[ri], 4 * sizeof(double));
     }
-    
+
     /* Handle remaining elements (wraparound + partial blocks + padding) */
     const size_t mask = cap - 1;
     for (; i < padded; i += 4)
     {
         size_t block = i / 4;
         size_t base = block * 16;
-        
+
         for (size_t j = 0; j < 4; j++)
         {
             size_t idx = i + j;
@@ -246,11 +245,11 @@ static void linearize_ring(bocpd_ultra_t *b)
 
 /*
  * Fast scalar log approximation for use in posterior updates.
- * 
+ *
  * Uses the standard technique of extracting exponent and computing
  * log of mantissa via polynomial. Accuracy ~1e-8 relative error
  * for x > 0.
- * 
+ *
  * This replaces ~60-80 cycle libm log() with ~15-20 cycles.
  */
 static inline double fast_log_scalar(double x)
@@ -258,37 +257,41 @@ static inline double fast_log_scalar(double x)
     /*
      * IEEE 754 double: x = 2^e * m, where m ∈ [1, 2)
      * log(x) = e * log(2) + log(m)
-     * 
+     *
      * We compute log(m) via polynomial approximation.
      * Transform: let t = (m - 1) / (m + 1), then
      * log(m) = 2 * (t + t³/3 + t⁵/5 + t⁷/7 + ...)
-     * 
+     *
      * This series converges faster than Taylor around 1.
      */
-    union { double d; uint64_t u; } u = { .d = x };
-    
+    union
+    {
+        double d;
+        uint64_t u;
+    } u = {.d = x};
+
     /* Extract exponent (biased by 1023) */
     int64_t e = (int64_t)((u.u >> 52) & 0x7FF) - 1023;
-    
+
     /* Set exponent to 0 → m ∈ [1, 2) */
     u.u = (u.u & 0x000FFFFFFFFFFFFFULL) | 0x3FF0000000000000ULL;
     double m = u.d;
-    
+
     /* t = (m - 1) / (m + 1) ∈ [0, 1/3) for m ∈ [1, 2) */
     double t = (m - 1.0) / (m + 1.0);
     double t2 = t * t;
-    
+
     /*
      * log(m) = 2t * (1 + t²/3 + t⁴/5 + t⁶/7 + t⁸/9)
      * Horner form for the polynomial in t²
      */
-    double poly = 1.0 + t2 * (0.3333333333333333 + 
-                        t2 * (0.2 + 
-                        t2 * (0.1428571428571429 + 
-                        t2 * 0.1111111111111111)));
-    
+    double poly = 1.0 + t2 * (0.3333333333333333 +
+                              t2 * (0.2 +
+                                    t2 * (0.1428571428571429 +
+                                          t2 * 0.1111111111111111)));
+
     double log_m = 2.0 * t * poly;
-    
+
     /* log(x) = e * log(2) + log(m) */
     return (double)e * 0.6931471805599453 + log_m;
 }
@@ -305,7 +308,7 @@ static inline double fast_log_scalar(double x)
  * @note Uses Welford's algorithm for β - numerically stable for streaming data.
  * @note Updates C1, C2, inv_sigma_sq_nu for immediate use in next prediction.
  */
-static inline void update_posterior_incremental(bocpd_ultra_t *b, size_t ri, double x)
+static inline void update_posterior_incremental(bocpd_asm_t *b, size_t ri, double x)
 {
     /*
      * Load current posterior state.
@@ -378,7 +381,7 @@ static inline void update_posterior_incremental(bocpd_ultra_t *b, size_t ri, dou
      *    = lgamma(α + 0.5) - lgamma(α) - ½ln(2απ) - ½ln(σ²)
      *
      * This absorbs all the "constant" (non-x-dependent) terms.
-     * 
+     *
      * OPTIMIZATION: Using fast_log_scalar for the log computations
      */
     double ln_nu_pi = fast_log_scalar(nu * M_PI);
@@ -400,7 +403,7 @@ static inline void update_posterior_incremental(bocpd_ultra_t *b, size_t ri, dou
  *
  * @note Called when creating a new run (changepoint hypothesis).
  */
-static inline void init_posterior_slot(bocpd_ultra_t *b, size_t ri)
+static inline void init_posterior_slot(bocpd_asm_t *b, size_t ri)
 {
     double kappa0 = b->prior.kappa0;
     double mu0 = b->prior.mu0;
@@ -448,7 +451,7 @@ static inline void init_posterior_slot(bocpd_ultra_t *b, size_t ri)
  *
  * OPTIMIZATIONS APPLIED:
  * - Hoisted index offset vectors outside loop (was _mm256_set_epi64x per iter)
- * - Replaced floor(t+0.5) with _mm256_round_pd 
+ * - Replaced floor(t+0.5) with _mm256_round_pd
  * - Fused truncation boundary search into main loop (eliminated second pass)
  * - Reduced memset to only needed entries
  * - Inlined polynomials for better cross-block ILP
@@ -486,7 +489,7 @@ static inline void init_posterior_slot(bocpd_ultra_t *b, size_t ri)
  * @note 2× unrolled AVX2 loop, no scalar remainder (arrays padded)
  * @note All loads are aligned (_mm256_load_pd)
  */
-static void fused_step_simd(bocpd_ultra_t *b, double x)
+static void fused_step_simd(bocpd_asm_t *b, double x)
 {
     const size_t n = b->active_len;
     if (n == 0)
@@ -535,7 +538,7 @@ static void fused_step_simd(bocpd_ultra_t *b, double x)
 #if BOCPD_USE_ASM
     /*=========================================================================
      * Assembly kernel path (V2 - Interleaved Layout)
-     * 
+     *
      * When BOCPD_USE_ASM is enabled, we dispatch to the hand-optimized
      * AVX2 assembly kernel for the inner loop. V2 uses interleaved data
      * layout for better cache utilization.
@@ -546,43 +549,42 @@ static void fused_step_simd(bocpd_ultra_t *b, double x)
         double max_growth_result = 0.0;
         size_t max_idx_result = 0;
         size_t last_valid_result = 0;
-        
+
         bocpd_kernel_args_t args = {
             .lin_interleaved = b->lin_interleaved,
-            .r_old           = r,
-            .x               = x,
-            .h               = h,
-            .omh             = omh,
-            .thresh          = thresh,
-            .n_padded        = n_padded,
-            .r_new           = r_new,
-            .r0_out          = &r0_result,
-            .max_growth_out  = &max_growth_result,
-            .max_idx_out     = &max_idx_result,
-            .last_valid_out  = &last_valid_result
-        };
-        
+            .r_old = r,
+            .x = x,
+            .h = h,
+            .omh = omh,
+            .thresh = thresh,
+            .n_padded = n_padded,
+            .r_new = r_new,
+            .r0_out = &r0_result,
+            .max_growth_out = &max_growth_result,
+            .max_idx_out = &max_idx_result,
+            .last_valid_out = &last_valid_result};
+
         bocpd_fused_loop_avx2(&args);
-        
+
         /* Extract results from assembly kernel */
         double r0 = r0_result;
         r_new[0] = r0;
-        
+
         size_t last_valid = last_valid_result;
-        
+
         /* Check if r0 itself is above threshold */
         if (r0 > thresh && last_valid == 0)
         {
             last_valid = 1;
         }
-        
+
         /* Compute new active length */
         size_t new_len = (last_valid > 0) ? last_valid + 1 : n + 1;
         if (new_len > b->capacity)
             new_len = b->capacity;
-        
+
         size_t new_len_padded = (new_len + 7) & ~7ULL;
-        
+
         /* Normalize (SIMD) */
         __m256d sum_acc = _mm256_setzero_pd();
         for (size_t i = 0; i < new_len_padded; i += 4)
@@ -590,13 +592,13 @@ static void fused_step_simd(bocpd_ultra_t *b, double x)
             __m256d rv = _mm256_loadu_pd(&r_new[i]);
             sum_acc = _mm256_add_pd(sum_acc, rv);
         }
-        
+
         __m128d lo = _mm256_castpd256_pd128(sum_acc);
         __m128d hi = _mm256_extractf128_pd(sum_acc, 1);
         lo = _mm_add_pd(lo, hi);
         lo = _mm_add_pd(lo, _mm_shuffle_pd(lo, lo, 1));
         double r_sum = _mm_cvtsd_f64(lo);
-        
+
         if (r_sum > 1e-300)
         {
             __m256d inv_sum = _mm256_set1_pd(1.0 / r_sum);
@@ -607,11 +609,11 @@ static void fused_step_simd(bocpd_ultra_t *b, double x)
                 _mm256_storeu_pd(&r[i], rv);
             }
         }
-        
+
         /* Update state */
         b->active_len = new_len;
-        
-        /* 
+
+        /*
          * For MAP, we need to compare assembly result with r0.
          * The assembly kernel tracks max within growth values,
          * but r0 is also a candidate.
@@ -624,14 +626,14 @@ static void fused_step_simd(bocpd_ultra_t *b, double x)
             map_idx = max_idx_result;
         }
         b->map_runlength = map_idx;
-        
+
         return;
     }
 #endif /* BOCPD_USE_ASM */
 
     /*=========================================================================
      * C implementation path (default)
-     * 
+     *
      * Hoist all SIMD constants outside the loop.
      * _mm256_set1_pd compiles to a broadcast, but hoisting avoids
      * redundant register allocation pressure.
@@ -654,10 +656,10 @@ static void fused_step_simd(bocpd_ultra_t *b, double x)
 
     /*
      * OPTIMIZATION: Running index vectors for MAP tracking.
-     * 
+     *
      * Old approach: _mm256_set1_epi64x(i) + add each iteration (2 µops, 3-cycle latency)
      * New approach: maintain running vectors, increment by 8 each iteration (1 µop)
-     * 
+     *
      * idx_vec_a starts at [1,2,3,4] and increments by 8 each iteration
      * idx_vec_b starts at [5,6,7,8] and increments by 8 each iteration
      */
@@ -675,11 +677,11 @@ static void fused_step_simd(bocpd_ultra_t *b, double x)
     /*=========================================================================
      * Shared constants
      *=========================================================================*/
-    const __m256d const_one = _mm256_set1_pd(1.0);  /* Used in const_one and exp */
+    const __m256d const_one = _mm256_set1_pd(1.0); /* Used in const_one and exp */
 
     /*=========================================================================
      * log1p polynomial constants (inlined for better ILP)
-     * 
+     *
      * Series: log(1+t) = t - t²/2 + t³/3 - t⁴/4 + t⁵/5 - t⁶/6
      * Using 6 terms instead of 8 - sufficient accuracy for our t range
      * and ~25% cheaper computation.
@@ -693,7 +695,7 @@ static void fused_step_simd(bocpd_ultra_t *b, double x)
 
     /*=========================================================================
      * exp polynomial constants (inlined for better ILP)
-     * 
+     *
      * exp(x) = 2^(x·log₂e) = 2^k · 2^f
      * where k = round(x·log₂e), f = x·log₂e - k
      * 2^f approximated via Taylor series for exp(f·ln2)
@@ -708,8 +710,8 @@ static void fused_step_simd(bocpd_ultra_t *b, double x)
     const __m256d exp_c4 = _mm256_set1_pd(0.009618129107628477);   /* ln⁴2/24 */
     const __m256d exp_c5 = _mm256_set1_pd(0.0013333558146428443);  /* ln⁵2/120 */
     const __m256d exp_c6 = _mm256_set1_pd(0.00015403530393381608); /* ln⁶2/720 */
-    
-    /* 
+
+    /*
      * Integer bias for 2^k construction (IEEE-754 exponent bias = 1023)
      * This is an INTEGER constant, used with vpaddq, NOT a double!
      */
@@ -734,7 +736,7 @@ static void fused_step_simd(bocpd_ultra_t *b, double x)
          * For index i (which is a multiple of 8), Block A uses indices i..i+3,
          * which is block number (i/4). Base offset = (i/4) * 16 doubles.
          *=====================================================================*/
-        
+
         size_t block_a = (i / 4);
         double *base_a = &b->lin_interleaved[block_a * 16];
 
@@ -775,31 +777,31 @@ static void fused_step_simd(bocpd_ultra_t *b, double x)
 
         /*
          * INLINED exp: pp = exp(ln_pp)
-         * 
+         *
          * Algorithm: exp(x) = 2^(x·log₂e) = 2^k · 2^f
          */
         /* Clamp input */
         __m256d x_clamped_a = _mm256_max_pd(_mm256_min_pd(ln_pp_a, exp_max_x), exp_min_x);
-        
+
         /* t = x / ln(2) */
         __m256d t_exp_a = _mm256_mul_pd(x_clamped_a, exp_inv_ln2);
-        
-        /* 
+
+        /*
          * OPTIMIZATION: Use _mm256_round_pd instead of floor(t + 0.5)
          * Saves 2-3 cycles per vector
          */
         __m256d k_a = _mm256_round_pd(t_exp_a, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-        
+
         /* f = t - k, fractional part */
         __m256d f_a = _mm256_sub_pd(t_exp_a, k_a);
-        
+
         /*
          * 2^f via Taylor series using ESTRIN'S SCHEME
-         * 
+         *
          * OPTIMIZATION: Estrin's method parallelizes polynomial evaluation.
          * Horner: c0 + f*(c1 + f*(c2 + f*(c3 + f*(c4 + f*(c5 + f*c6)))))
          *   → 6 sequential dependent FMAs
-         * 
+         *
          * Estrin: Group into pairs, compute f², then combine
          *   p01 = c0 + f*c1           p23 = c2 + f*c3
          *   p45 = c4 + f*c5           p6  = c6
@@ -807,34 +809,34 @@ static void fused_step_simd(bocpd_ultra_t *b, double x)
          *   q0123 = p01 + f2*p23      q456 = p45 + f2*p6
          *   f4 = f2*f2
          *   result = q0123 + f4*q456
-         * 
+         *
          * Dependency depth: 4 FMAs instead of 6
          * Better utilizes dual FMA units on modern cores.
-         * 
+         *
          * Polynomial: 1 + f*c1 + f²*c2 + f³*c3 + f⁴*c4 + f⁵*c5 + f⁶*c6
          */
         __m256d f2_a = _mm256_mul_pd(f_a, f_a);
-        
+
         /* Level 1: Compute pairs (can execute in parallel) */
-        __m256d p01_a = _mm256_fmadd_pd(f_a, exp_c1, const_one);  /* 1 + f*c1 */
-        __m256d p23_a = _mm256_fmadd_pd(f_a, exp_c3, exp_c2);   /* c2 + f*c3 */
-        __m256d p45_a = _mm256_fmadd_pd(f_a, exp_c5, exp_c4);   /* c4 + f*c5 */
+        __m256d p01_a = _mm256_fmadd_pd(f_a, exp_c1, const_one); /* 1 + f*c1 */
+        __m256d p23_a = _mm256_fmadd_pd(f_a, exp_c3, exp_c2);    /* c2 + f*c3 */
+        __m256d p45_a = _mm256_fmadd_pd(f_a, exp_c5, exp_c4);    /* c4 + f*c5 */
         /* p6 = c6 (just the constant) */
-        
+
         /* Level 2: Combine pairs with f² */
-        __m256d q0123_a = _mm256_fmadd_pd(f2_a, p23_a, p01_a);  /* p01 + f²*p23 */
-        __m256d q456_a = _mm256_fmadd_pd(f2_a, exp_c6, p45_a);  /* p45 + f²*c6 */
-        
+        __m256d q0123_a = _mm256_fmadd_pd(f2_a, p23_a, p01_a); /* p01 + f²*p23 */
+        __m256d q456_a = _mm256_fmadd_pd(f2_a, exp_c6, p45_a); /* p45 + f²*c6 */
+
         /* Level 3: Final combination with f⁴ */
         __m256d f4_a = _mm256_mul_pd(f2_a, f2_a);
         __m256d exp_poly_a = _mm256_fmadd_pd(f4_a, q456_a, q0123_a);
-        
+
         /*
          * CORRECT 2^k RECONSTRUCTION (IEEE-754 compliant)
-         * 
+         *
          * A double 2^k has: sign=0, exponent=(k+1023), mantissa=0
          * So the bit pattern is: (k + 1023) << 52
-         * 
+         *
          * Since AVX2 lacks _mm256_cvtpd_epi64, we use the int32 path:
          * 1. Convert double k to int32 (valid since k ∈ [-1010, 1023])
          * 2. Sign-extend int32 to int64
@@ -842,12 +844,12 @@ static void fused_step_simd(bocpd_ultra_t *b, double x)
          * 4. Shift left by 52 to exponent position
          * 5. Reinterpret as double
          */
-        __m128i k_int32_a = _mm256_cvtpd_epi32(k_a);        /* 4 doubles → 4 int32 in xmm */
+        __m128i k_int32_a = _mm256_cvtpd_epi32(k_a);          /* 4 doubles → 4 int32 in xmm */
         __m256i k_int64_a = _mm256_cvtepi32_epi64(k_int32_a); /* sign-extend to int64 */
         __m256i exp_biased_a = _mm256_add_epi64(k_int64_a, exp_bias_int);
         __m256i exp_bits_a = _mm256_slli_epi64(exp_biased_a, 52);
-        __m256d scale_a = _mm256_castsi256_pd(exp_bits_a);  /* This IS exactly 2^k */
-        
+        __m256d scale_a = _mm256_castsi256_pd(exp_bits_a); /* This IS exactly 2^k */
+
         /* exp(x) = 2^f · 2^k */
         __m256d pp_a = _mm256_mul_pd(exp_poly_a, scale_a);
         pp_a = _mm256_max_pd(pp_a, min_pp);
@@ -889,10 +891,14 @@ static void fused_step_simd(bocpd_ultra_t *b, double x)
         if (mask_a)
         {
             /* Find rightmost set bit → highest valid index in this block */
-            if (mask_a & 8) last_valid = i + 4;
-            else if (mask_a & 4) last_valid = i + 3;
-            else if (mask_a & 2) last_valid = i + 2;
-            else if (mask_a & 1) last_valid = i + 1;
+            if (mask_a & 8)
+                last_valid = i + 4;
+            else if (mask_a & 4)
+                last_valid = i + 3;
+            else if (mask_a & 2)
+                last_valid = i + 2;
+            else if (mask_a & 1)
+                last_valid = i + 1;
         }
 
         /*=====================================================================
@@ -931,27 +937,27 @@ static void fused_step_simd(bocpd_ultra_t *b, double x)
         __m256d t_exp_b = _mm256_mul_pd(x_clamped_b, exp_inv_ln2);
         __m256d k_b = _mm256_round_pd(t_exp_b, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
         __m256d f_b = _mm256_sub_pd(t_exp_b, k_b);
-        
+
         /* Estrin's scheme for 2^f polynomial - block B */
         __m256d f2_b = _mm256_mul_pd(f_b, f_b);
-        
+
         __m256d p01_b = _mm256_fmadd_pd(f_b, exp_c1, const_one);
         __m256d p23_b = _mm256_fmadd_pd(f_b, exp_c3, exp_c2);
         __m256d p45_b = _mm256_fmadd_pd(f_b, exp_c5, exp_c4);
-        
+
         __m256d q0123_b = _mm256_fmadd_pd(f2_b, p23_b, p01_b);
         __m256d q456_b = _mm256_fmadd_pd(f2_b, exp_c6, p45_b);
-        
+
         __m256d f4_b = _mm256_mul_pd(f2_b, f2_b);
         __m256d exp_poly_b = _mm256_fmadd_pd(f4_b, q456_b, q0123_b);
-        
+
         /* CORRECT 2^k reconstruction for block B */
         __m128i k_int32_b = _mm256_cvtpd_epi32(k_b);
         __m256i k_int64_b = _mm256_cvtepi32_epi64(k_int32_b);
         __m256i exp_biased_b = _mm256_add_epi64(k_int64_b, exp_bias_int);
         __m256i exp_bits_b = _mm256_slli_epi64(exp_biased_b, 52);
         __m256d scale_b = _mm256_castsi256_pd(exp_bits_b);
-        
+
         __m256d pp_b = _mm256_mul_pd(exp_poly_b, scale_b);
         pp_b = _mm256_max_pd(pp_b, min_pp);
 
@@ -974,12 +980,16 @@ static void fused_step_simd(bocpd_ultra_t *b, double x)
         int mask_b = _mm256_movemask_pd(thresh_cmp_b);
         if (mask_b)
         {
-            if (mask_b & 8) last_valid = i + 8;
-            else if (mask_b & 4) last_valid = i + 7;
-            else if (mask_b & 2) last_valid = i + 6;
-            else if (mask_b & 1) last_valid = i + 5;
+            if (mask_b & 8)
+                last_valid = i + 8;
+            else if (mask_b & 4)
+                last_valid = i + 7;
+            else if (mask_b & 2)
+                last_valid = i + 6;
+            else if (mask_b & 1)
+                last_valid = i + 5;
         }
-        
+
         /*
          * OPTIMIZATION: Increment running index vectors for next iteration.
          * This replaces _mm256_set1_epi64x(i) + add with single vpaddq.
@@ -1043,7 +1053,7 @@ static void fused_step_simd(bocpd_ultra_t *b, double x)
         }
     }
 
-    /* 
+    /*
      * OPTIMIZATION: Truncation boundary already computed in main loop.
      * No second pass needed - last_valid was tracked during iteration.
      */
@@ -1114,7 +1124,7 @@ static void fused_step_simd(bocpd_ultra_t *b, double x)
  *
  * @post Ring buffer shifted, all posteriors updated with x
  */
-static void shift_and_observe(bocpd_ultra_t *b, double x)
+static void shift_and_observe(bocpd_asm_t *b, double x)
 {
     const size_t n = b->active_len;
 
@@ -1157,7 +1167,7 @@ static void shift_and_observe(bocpd_ultra_t *b, double x)
  * Public API Implementation
  *=============================================================================*/
 
-int bocpd_ultra_init(bocpd_ultra_t *b, double hazard_lambda,
+int bocpd_ultra_init(bocpd_asm_t *b, double hazard_lambda,
                      bocpd_prior_t prior, size_t max_run_length)
 {
     /* Validate inputs */
@@ -1183,12 +1193,12 @@ int bocpd_ultra_init(bocpd_ultra_t *b, double hazard_lambda,
     b->ring_start = 0;
 
     size_t alloc = cap * sizeof(double);
-    
+
     /*
      * CRITICAL: r_scratch needs extra padding because the SIMD loop writes
      * to r_new[i+1..i+8]. When i = n_padded - 8, we write up to index
      * n_padded, which equals capacity. So we need capacity + 8 elements.
-     * 
+     *
      * Round up to multiple of 64 for aligned_alloc requirement.
      */
     size_t alloc_scratch = ((cap + 8) * sizeof(double) + 63) & ~63ULL;
@@ -1228,7 +1238,7 @@ int bocpd_ultra_init(bocpd_ultra_t *b, double hazard_lambda,
      */
     size_t alloc_interleaved = ((cap + 8) * 4 * sizeof(double) + 63) & ~63ULL;
     b->lin_interleaved = aligned_alloc(64, alloc_interleaved);
-    
+
     /* Legacy pointers no longer used - set to NULL */
     b->lin_mu = NULL;
     b->lin_C1 = NULL;
@@ -1261,7 +1271,7 @@ int bocpd_ultra_init(bocpd_ultra_t *b, double hazard_lambda,
     return 0;
 }
 
-void bocpd_ultra_free(bocpd_ultra_t *b)
+void bocpd_ultra_free(bocpd_asm_t *b)
 {
     if (!b)
         return;
@@ -1287,7 +1297,7 @@ void bocpd_ultra_free(bocpd_ultra_t *b)
     memset(b, 0, sizeof(*b));
 }
 
-void bocpd_ultra_reset(bocpd_ultra_t *b)
+void bocpd_ultra_reset(bocpd_asm_t *b)
 {
     if (!b)
         return;
@@ -1298,7 +1308,7 @@ void bocpd_ultra_reset(bocpd_ultra_t *b)
     b->ring_start = 0;
 }
 
-void bocpd_ultra_step(bocpd_ultra_t *b, double x)
+void bocpd_ultra_step(bocpd_asm_t *b, double x)
 {
     if (!b)
         return;
