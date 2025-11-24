@@ -27,6 +27,8 @@
 extern "C" {
 #endif
 
+#define ALIGN64 __attribute__((aligned(64)))
+
 /*=============================================================================
  * Kernel Variant Selection
  *
@@ -64,12 +66,12 @@ extern "C" {
  *
  * where τ = 1/σ² (precision).
  */
-typedef struct bocpd_asm_prior {
+typedef struct bocpd_prior {
     double mu0;     /**< Prior mean */
     double kappa0;  /**< Prior mean strength (pseudo-observations) */
     double alpha0;  /**< Precision shape (> 0) */
     double beta0;   /**< Precision rate (> 0), E[σ²] ≈ β₀/(α₀-1) for α₀>1 */
-} bocpd_asm_prior_t;
+} bocpd_prior_t;
 
 /*=============================================================================
  * Detector State
@@ -89,7 +91,7 @@ typedef struct bocpd_asm {
     double hazard;              /**< Hazard rate h = 1/λ */
     double one_minus_h;         /**< Precomputed 1-h */
     double trunc_thresh;        /**< Truncation threshold (default 1e-12) */
-    bocpd_asm_prior_t prior;    /**< Prior parameters */
+    bocpd_prior_t prior;        /**< Prior parameters */
 
     /*-------------------------------------------------------------------------
      * Ring buffer state
@@ -134,6 +136,14 @@ typedef struct bocpd_asm {
     double *lin_interleaved;    /**< Interleaved parameter blocks */
 
     /*-------------------------------------------------------------------------
+     * Legacy pointers (for compatibility, point into lin_interleaved)
+     *-------------------------------------------------------------------------*/
+    double *lin_mu;             /**< Linearized posterior means (legacy) */
+    double *lin_C1;             /**< Linearized C1 constants (legacy) */
+    double *lin_C2;             /**< Linearized C2 constants (legacy) */
+    double *lin_inv_ssn;        /**< Linearized 1/(σ²ν) values (legacy) */
+
+    /*-------------------------------------------------------------------------
      * Run-length distribution
      *-------------------------------------------------------------------------*/
     double *r;                  /**< Current distribution P(r_t | x_{1:t}) */
@@ -144,7 +154,7 @@ typedef struct bocpd_asm {
      *-------------------------------------------------------------------------*/
     size_t t;                   /**< Current timestep */
     size_t map_runlength;       /**< MAP estimate of run length */
-    double evidence;            /**< Normalization constant (for debugging) */
+    double p_changepoint;       /**< P(r_t < 5) - quick changepoint indicator */
 
 } bocpd_asm_t;
 
@@ -162,18 +172,18 @@ typedef struct bocpd_asm {
  *
  * @return 0 on success, -1 on allocation failure
  */
-int bocpd_asm_init(bocpd_asm_t *b, double hazard_lambda,
-                   bocpd_asm_prior_t prior, size_t max_run_length);
+int bocpd_ultra_init(bocpd_asm_t *b, double hazard_lambda,
+                     bocpd_prior_t prior, size_t max_run_length);
 
 /**
  * @brief Free detector resources.
  */
-void bocpd_asm_free(bocpd_asm_t *b);
+void bocpd_ultra_free(bocpd_asm_t *b);
 
 /**
  * @brief Reset detector to initial state (preserves configuration).
  */
-void bocpd_asm_reset(bocpd_asm_t *b);
+void bocpd_ultra_reset(bocpd_asm_t *b);
 
 /**
  * @brief Process one observation.
@@ -183,37 +193,34 @@ void bocpd_asm_reset(bocpd_asm_t *b);
  *
  * Complexity: O(active_len), typically 1.5-2.5 µs
  */
-void bocpd_asm_step(bocpd_asm_t *b, double x);
-
-/**
- * @brief Get probability of recent changepoint.
- *
- * @param b      Detector state
- * @param window Run lengths to consider as "recent" (typically 3-10)
- *
- * @return P(run_length < window)
- */
-double bocpd_asm_change_prob(const bocpd_asm_t *b, size_t window);
+void bocpd_ultra_step(bocpd_asm_t *b, double x);
 
 /**
  * @brief Get MAP run length estimate.
  */
-static inline size_t bocpd_asm_get_map(const bocpd_asm_t *b) {
+static inline size_t bocpd_ultra_get_map(const bocpd_asm_t *b) {
     return b->map_runlength;
 }
 
 /**
  * @brief Get current timestep.
  */
-static inline size_t bocpd_asm_get_t(const bocpd_asm_t *b) {
+static inline size_t bocpd_ultra_get_t(const bocpd_asm_t *b) {
     return b->t;
+}
+
+/**
+ * @brief Get quick changepoint probability P(run_length < 5).
+ */
+static inline double bocpd_ultra_get_change_prob(const bocpd_asm_t *b) {
+    return b->p_changepoint;
 }
 
 /*=============================================================================
  * Assembly Kernel Interface (Internal)
  *
  * These declarations are exposed for advanced users who want to call
- * kernels directly. Normal usage should go through bocpd_asm_step().
+ * kernels directly. Normal usage should go through bocpd_ultra_step().
  *=============================================================================*/
 
 /**
