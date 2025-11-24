@@ -453,4 +453,4 @@ MIT License. See [LICENSE](LICENSE).
 
 ---
 
-*Built for speed. Designed for trading.*
+*Built for speed. Designed for trading. Open for all*
