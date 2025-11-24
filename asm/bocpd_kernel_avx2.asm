@@ -1,41 +1,90 @@
 ;==============================================================================
-; BOCPD Ultra-Optimized AVX2 Kernel - CORRECTED VERSION
+; BOCPD Ultra-Optimized AVX2 Kernel - V2 (Interleaved Layout)
 ;
-; This kernel implements the inner loop of the BOCPD algorithm with:
-; - Correct IEEE-754 2^k reconstruction (no magic number hack)
-; - Correct truncation logic (matching C version exactly)
-; - Correct stack alignment (32-byte for AVX2)
-; - Integer constants stored and used correctly
+; ALGORITHM OVERVIEW
+; ==================
+; Bayesian Online Changepoint Detection (BOCPD) maintains a probability
+; distribution r[i] over "run lengths" - how long since the last changepoint.
+;
+; For each new observation x, we update:
+;   1. Compute predictive probability: pp[i] = P(x | run_length=i)
+;      Using Student-t: pp = exp(C1 - C2 * log1p((x-μ)² / (σ²ν)))
+;   2. Growth probability:   growth[i] = r[i] * pp[i] * (1-h)
+;   3. Changepoint prob:     r_new[0] += r[i] * pp[i] * h
+;   4. Shift and store:      r_new[i+1] = growth[i]
+;
+; This kernel processes 8 elements per iteration (2 SIMD blocks of 4).
+;
+; KEY OPTIMIZATIONS
+; =================
+; 1. INTERLEAVED MEMORY LAYOUT
+;    Instead of 4 separate arrays, parameters are interleaved:
+;      Block k: [mu[4k:4k+3], C1[4k:4k+3], C2[4k:4k+3], inv_ssn[4k:4k+3]]
+;    Each block = 128 bytes = 2 cache lines (perfect spatial locality)
+;
+; 2. RUNNING INDEX VECTORS
+;    Instead of: idx = broadcast(i) + offset  (2 µops, 3-cycle latency)
+;    We use:     idx_vec += 8 each iteration  (1 µop, 1-cycle latency)
+;
+; 3. ESTRIN'S POLYNOMIAL SCHEME
+;    For exp(), groups terms to reduce dependency depth from 6 to 4 FMAs
+;
+; 4. IEEE-754 DIRECT EXPONENT MANIPULATION
+;    Computes 2^k by directly constructing the bit pattern, avoiding libm
+;
+; 5. SHARED CONSTANTS
+;    const_one used by both log1p (c1=1) and exp (base=1)
+;
+; REGISTER ALLOCATION
+; ===================
+; Callee-saved (preserved):
+;   r8=lin_interleaved, r12=r_old, r13=r_new, r14=n_padded, rdi=args
+;   rsi=loop_counter, rbx=last_valid
+;
+; Dedicated YMM (never spilled):
+;   ymm8=x, ymm9=h, ymm10=1-h, ymm11=threshold
+;   ymm12=r0_accumulator, ymm13=max_growth_A, ymm14=max_growth_B
+;   ymm15=idx_vec_A
+;
+; Scratch: ymm0-ymm7 (reused freely each iteration)
 ;
 ; Calling convention: System V AMD64 ABI
-; void bocpd_kernel_avx2(const bocpd_kernel_args_t *args);
+; void bocpd_fused_loop_avx2(const bocpd_kernel_args_t *args);
 ;
 ; Input structure (bocpd_kernel_args_t):
-;   +0   double* lin_mu
-;   +8   double* lin_C1
-;   +16  double* lin_C2
-;   +24  double* lin_inv_ssn
-;   +32  double* r_old
-;   +40  double  x
-;   +48  double  h
-;   +56  double  one_minus_h
-;   +64  double  trunc_thresh
-;   +72  size_t  n_padded
-;   +80  double* r_new
-;   +88  double* r0_out
-;   +96  double* max_growth_out
-;   +104 size_t* max_idx_out
-;   +112 size_t* last_valid_out
+;   +0   double* lin_interleaved  ; Interleaved [mu×4, C1×4, C2×4, inv_ssn×4]
+;   +8   double* r_old            ; Current run-length distribution
+;   +16  double  x                ; New observation
+;   +24  double  h                ; Hazard rate P(changepoint)
+;   +32  double  one_minus_h      ; 1 - h (precomputed)
+;   +40  double  trunc_thresh     ; Truncation threshold
+;   +48  size_t  n_padded         ; Array length (multiple of 8)
+;   +56  double* r_new            ; Output distribution
+;   +64  double* r0_out           ; Output: sum of changepoint probs
+;   +72  double* max_growth_out   ; Output: max growth value (for MAP)
+;   +80  size_t* max_idx_out      ; Output: index of max growth
+;   +88  size_t* last_valid_out   ; Output: last index above threshold
 ;==============================================================================
 
+; Mark stack as non-executable (ELF security best practice)
+section .note.GNU-stack noalloc noexec nowrite progbits
+
 section .rodata
-align 32
+align 32                            ; AVX2 requires 32-byte alignment
 
 ;------------------------------------------------------------------------------
-; log1p polynomial coefficients (for t in [0, ~2])
-; log(1+t) ≈ t * (c1 + t*(c2 + t*(c3 + t*(c4 + t*(c5 + t*c6)))))
+; SHARED CONSTANT: 1.0
+; Used as c1 in log1p polynomial AND as base value in exp polynomial
+; Saves one constant slot (register pressure reduction)
 ;------------------------------------------------------------------------------
-log1p_c1:   dq 1.0, 1.0, 1.0, 1.0
+const_one:      dq 1.0, 1.0, 1.0, 1.0
+
+;------------------------------------------------------------------------------
+; LOG1P POLYNOMIAL: log(1+t) ≈ t * (c1 + t*(c2 + t*(c3 + ...)))
+; Taylor series: log(1+t) = t - t²/2 + t³/3 - t⁴/4 + ...
+; Coefficients: c1=1, c2=-1/2, c3=1/3, c4=-1/4, c5=1/5, c6=-1/6
+; (c1 uses const_one above)
+;------------------------------------------------------------------------------
 log1p_c2:   dq -0.5, -0.5, -0.5, -0.5
 log1p_c3:   dq 0.3333333333333333, 0.3333333333333333, 0.3333333333333333, 0.3333333333333333
 log1p_c4:   dq -0.25, -0.25, -0.25, -0.25
@@ -43,63 +92,68 @@ log1p_c5:   dq 0.2, 0.2, 0.2, 0.2
 log1p_c6:   dq -0.16666666666666666, -0.16666666666666666, -0.16666666666666666, -0.16666666666666666
 
 ;------------------------------------------------------------------------------
-; exp polynomial coefficients (for 2^f where f in [-0.5, 0.5])
-; 2^f ≈ 1 + f*c1 + f²*c2 + f³*c3 + f⁴*c4 + f⁵*c5 + f⁶*c6
-; where c_i = ln(2)^i / i!
+; EXP POLYNOMIAL: 2^f ≈ 1 + f*c1 + f²*c2 + f³*c3 + f⁴*c4 + f⁵*c5 + f⁶*c6
+;
+; Strategy: exp(x) = 2^(x * log2(e)) = 2^t where t = x / ln(2)
+; Split: t = k + f where k = round(t), f = t - k, |f| ≤ 0.5
+; Then: exp(x) = 2^k * 2^f
+;   - 2^k computed via IEEE-754 exponent bit manipulation
+;   - 2^f approximated by this polynomial (accurate for |f| ≤ 0.5)
+;
+; Coefficients: c_i = ln(2)^i / i!
 ;------------------------------------------------------------------------------
-exp_c1:     dq 0.6931471805599453, 0.6931471805599453, 0.6931471805599453, 0.6931471805599453
-exp_c2:     dq 0.24022650695910072, 0.24022650695910072, 0.24022650695910072, 0.24022650695910072
-exp_c3:     dq 0.05550410866482158, 0.05550410866482158, 0.05550410866482158, 0.05550410866482158
+exp_c1:     dq 0.6931471805599453, 0.6931471805599453, 0.6931471805599453, 0.6931471805599453      ; ln(2)
+exp_c2:     dq 0.24022650695910072, 0.24022650695910072, 0.24022650695910072, 0.24022650695910072  ; ln(2)²/2
+exp_c3:     dq 0.05550410866482158, 0.05550410866482158, 0.05550410866482158, 0.05550410866482158  ; ln(2)³/6
 exp_c4:     dq 0.009618129107628477, 0.009618129107628477, 0.009618129107628477, 0.009618129107628477
 exp_c5:     dq 0.0013333558146428443, 0.0013333558146428443, 0.0013333558146428443, 0.0013333558146428443
 exp_c6:     dq 0.00015403530393381608, 0.00015403530393381608, 0.00015403530393381608, 0.00015403530393381608
 
 ;------------------------------------------------------------------------------
-; exp() range constants
+; EXP HELPER CONSTANTS
 ;------------------------------------------------------------------------------
-exp_inv_ln2:    dq 1.4426950408889634, 1.4426950408889634, 1.4426950408889634, 1.4426950408889634
-exp_min_x:      dq -700.0, -700.0, -700.0, -700.0
-exp_max_x:      dq 700.0, 700.0, 700.0, 700.0
-const_one:      dq 1.0, 1.0, 1.0, 1.0
+exp_inv_ln2:    dq 1.4426950408889634, 1.4426950408889634, 1.4426950408889634, 1.4426950408889634  ; log2(e) = 1/ln(2)
+exp_min_x:      dq -700.0, -700.0, -700.0, -700.0      ; Clamp floor: exp(-700) ≈ 1e-304
+exp_max_x:      dq 700.0, 700.0, 700.0, 700.0          ; Clamp ceil: exp(700) ≈ 1e304
 
 ;------------------------------------------------------------------------------
-; INTEGER constants (stored as int64, NOT doubles!)
-; These are used with vpaddq, NOT vaddpd
+; IEEE-754 EXPONENT BIAS (as int64, NOT float!)
+; Double format: [sign:1][exponent:11][mantissa:52]
+; Exponent uses bias-1023: stored_exp = actual_exp + 1023
+; To create 2^k: set exponent = k+1023, shift left 52 bits
 ;------------------------------------------------------------------------------
-bias_1023:      dq 1023, 1023, 1023, 1023      ; Exponent bias for IEEE-754
+bias_1023:      dq 1023, 1023, 1023, 1023
 
 ;------------------------------------------------------------------------------
-; Other constants
+; NUMERICAL FLOOR: minimum predictive probability
+; Prevents log(0) or divide-by-zero in downstream calculations
 ;------------------------------------------------------------------------------
-const_zero:     dq 0.0, 0.0, 0.0, 0.0
 const_min_pp:   dq 1.0e-300, 1.0e-300, 1.0e-300, 1.0e-300
 
 ;------------------------------------------------------------------------------
-; Index offset vectors (as doubles for blendv compatibility)
-; Block A: i+1, i+2, i+3, i+4
-; Block B: i+5, i+6, i+7, i+8
+; Running index vectors (as doubles for blendv)
+; Initial values: Block A = [1,2,3,4], Block B = [5,6,7,8]
+; Increment = 8 each iteration
 ;------------------------------------------------------------------------------
-idx_offset_a:   dq 1.0, 2.0, 3.0, 4.0
-idx_offset_b:   dq 5.0, 6.0, 7.0, 8.0
+idx_init_a:     dq 1.0, 2.0, 3.0, 4.0
+idx_init_b:     dq 5.0, 6.0, 7.0, 8.0
+idx_increment:  dq 8.0, 8.0, 8.0, 8.0
 
 ;------------------------------------------------------------------------------
-; Structure offsets
+; Structure offsets - UPDATED FOR INTERLEAVED LAYOUT
 ;------------------------------------------------------------------------------
-%define ARG_LIN_MU          0
-%define ARG_LIN_C1          8
-%define ARG_LIN_C2          16
-%define ARG_LIN_INV_SSN     24
-%define ARG_R_OLD           32
-%define ARG_X               40
-%define ARG_H               48
-%define ARG_OMH             56
-%define ARG_THRESH          64
-%define ARG_N_PADDED        72
-%define ARG_R_NEW           80
-%define ARG_R0_OUT          88
-%define ARG_MAX_GROWTH      96
-%define ARG_MAX_IDX         104
-%define ARG_LAST_VALID      112
+%define ARG_LIN_INTERLEAVED 0
+%define ARG_R_OLD           8
+%define ARG_X               16
+%define ARG_H               24
+%define ARG_OMH             32
+%define ARG_THRESH          40
+%define ARG_N_PADDED        48
+%define ARG_R_NEW           56
+%define ARG_R0_OUT          64
+%define ARG_MAX_GROWTH      72
+%define ARG_MAX_IDX         80
+%define ARG_LAST_VALID      88
 
 ;------------------------------------------------------------------------------
 ; Stack layout (must be multiple of 32 for alignment)
@@ -109,24 +163,16 @@ idx_offset_b:   dq 5.0, 6.0, 7.0, 8.0
 ; [rsp + 64]  = max_growth_B (32 bytes, 4 doubles)
 ; [rsp + 96]  = max_idx_A (32 bytes, 4 doubles)
 ; [rsp + 128] = scratch space
+; [rsp + 160] = idx_vec_B (32 bytes)
 ;------------------------------------------------------------------------------
-%define STACK_SIZE          192     ; Space for YMM spills and scratch
+%define STACK_SIZE          224
 
 section .text
-global bocpd_kernel_avx2
+global bocpd_fused_loop_avx2
 
-;==============================================================================
-; Main kernel entry point
-;==============================================================================
-bocpd_kernel_avx2:
+bocpd_fused_loop_avx2:
     ;--------------------------------------------------------------------------
-    ; Prologue with correct 32-byte stack alignment
-    ;
-    ; Order of operations:
-    ; 1. Push all callee-saved registers
-    ; 2. Set up frame pointer
-    ; 3. Align stack to 32 bytes
-    ; 4. Allocate local space
+    ; Prologue with correct stack alignment
     ;--------------------------------------------------------------------------
     push        rbp
     push        rbx
@@ -135,43 +181,25 @@ bocpd_kernel_avx2:
     push        r14
     push        r15
     
-    ; Set up frame pointer AFTER all pushes
     mov         rbp, rsp
-    
-    ; Align stack to 32 bytes and allocate local space
     sub         rsp, STACK_SIZE + 32
     and         rsp, -32
     
     ;--------------------------------------------------------------------------
-    ; Load scalar arguments into preserved registers
+    ; Load pointers into preserved registers
     ;--------------------------------------------------------------------------
-    mov         r8,  [rdi + ARG_LIN_MU]
-    mov         r9,  [rdi + ARG_LIN_C1]
-    mov         r10, [rdi + ARG_LIN_C2]
-    mov         r11, [rdi + ARG_LIN_INV_SSN]
+    mov         r8,  [rdi + ARG_LIN_INTERLEAVED]
     mov         r12, [rdi + ARG_R_OLD]
     mov         r13, [rdi + ARG_R_NEW]
     mov         r14, [rdi + ARG_N_PADDED]
     
     ;--------------------------------------------------------------------------
     ; Load broadcast scalars into YMM registers
-    ;
-    ; Register allocation:
-    ;   ymm8  = x (observation value, broadcast)
-    ;   ymm9  = h (hazard rate, broadcast)
-    ;   ymm10 = 1-h (one minus hazard, broadcast)
-    ;   ymm11 = threshold (truncation threshold, broadcast)
-    ;   ymm12 = r0 accumulator (changepoint probability sum)
-    ;   ymm13 = max_growth_A accumulator (block A running max)
-    ;   ymm14 = max_growth_B accumulator (block B running max)
-    ;   ymm15 = max_idx_A accumulator (block A index of max, as doubles for blend)
-    ;   
-    ; For max_idx_B, we'll use stack storage since we're out of preserved YMM regs
     ;--------------------------------------------------------------------------
-    vbroadcastsd ymm8,  qword [rdi + ARG_X]         ; x (observation)
-    vbroadcastsd ymm9,  qword [rdi + ARG_H]         ; h (hazard)
-    vbroadcastsd ymm10, qword [rdi + ARG_OMH]       ; 1-h
-    vbroadcastsd ymm11, qword [rdi + ARG_THRESH]    ; truncation threshold
+    vbroadcastsd ymm8,  qword [rdi + ARG_X]
+    vbroadcastsd ymm9,  qword [rdi + ARG_H]
+    vbroadcastsd ymm10, qword [rdi + ARG_OMH]
+    vbroadcastsd ymm11, qword [rdi + ARG_THRESH]
     
     ;--------------------------------------------------------------------------
     ; Initialize accumulators
@@ -179,17 +207,18 @@ bocpd_kernel_avx2:
     vxorpd      ymm12, ymm12, ymm12                 ; r0 accumulator = 0
     vxorpd      ymm13, ymm13, ymm13                 ; max_growth_A = 0  
     vxorpd      ymm14, ymm14, ymm14                 ; max_growth_B = 0
-    vxorpd      ymm15, ymm15, ymm15                 ; max_idx_A = 0 (as doubles for blendv)
     
-    ; Initialize max_idx_B on stack
+    ; Initialize running index vectors
+    vmovapd     ymm15, [rel idx_init_a]             ; idx_vec_A = [1,2,3,4]
+    vmovapd     ymm0, [rel idx_init_b]
+    vmovapd     [rsp + 160], ymm0                   ; idx_vec_B on stack
+    
+    ; Initialize max_idx accumulators
     vxorpd      ymm0, ymm0, ymm0
     vmovapd     [rsp], ymm0                         ; max_idx_B = 0
+    vmovapd     [rsp + 96], ymm0                    ; max_idx_A = 0
     
     xor         rbx, rbx                             ; last_valid = 0
-    
-    ;--------------------------------------------------------------------------
-    ; Main loop: process 8 elements per iteration (2 blocks of 4)
-    ;--------------------------------------------------------------------------
     xor         rsi, rsi                             ; i = 0
     
 .loop:
@@ -198,239 +227,59 @@ bocpd_kernel_avx2:
     
     ;==========================================================================
     ; Block A: indices i+0 to i+3
+    ; Base offset = (i/4) * 128 = i * 32
     ;==========================================================================
     
-    ; Load data for block A
-    vmovapd     ymm0, [r8  + rsi*8]                 ; lin_mu[i..i+3]
-    vmovapd     ymm1, [r9  + rsi*8]                 ; lin_C1[i..i+3]
-    vmovapd     ymm2, [r10 + rsi*8]                 ; lin_C2[i..i+3]
-    vmovapd     ymm3, [r11 + rsi*8]                 ; lin_inv_ssn[i..i+3]
-    vmovapd     ymm4, [r12 + rsi*8]                 ; r_old[i..i+3]
+    mov         rax, rsi
+    shl         rax, 5                              ; rax = i * 32
     
-    ; Compute z² = (x - μ)²
-    vsubpd      ymm5, ymm8, ymm0                    ; z = x - mu
-    vmulpd      ymm5, ymm5, ymm5                    ; z² = z * z
+    ; Load from interleaved buffer
+    vmovapd     ymm0, [r8 + rax]                    ; mu_a
+    vmovapd     ymm1, [r8 + rax + 32]               ; C1_a
+    vmovapd     ymm2, [r8 + rax + 64]               ; C2_a
+    vmovapd     ymm3, [r8 + rax + 96]               ; inv_ssn_a
+    vmovapd     ymm4, [r12 + rsi*8]                 ; r_old_a
     
-    ; t = z² * inv_sigma_sq_nu
-    vmulpd      ymm5, ymm5, ymm3                    ; t = z² * inv_ssn
-    
-    ; log1p(t) via Horner's method
-    ; poly = c1 + t*(c2 + t*(c3 + t*(c4 + t*(c5 + t*c6))))
-    vmovapd     ymm6, [rel log1p_c6]
-    vfmadd213pd ymm6, ymm5, [rel log1p_c5]          ; c5 + t*c6
-    vfmadd213pd ymm6, ymm5, [rel log1p_c4]          ; c4 + t*(...)
-    vfmadd213pd ymm6, ymm5, [rel log1p_c3]          ; c3 + t*(...)
-    vfmadd213pd ymm6, ymm5, [rel log1p_c2]          ; c2 + t*(...)
-    vfmadd213pd ymm6, ymm5, [rel log1p_c1]          ; c1 + t*(...)
-    vmulpd      ymm6, ymm6, ymm5                    ; log1p(t) = t * poly
-    
-    ; ln_pp = C1 + C2 * log1p(t)
-    vfmadd231pd ymm1, ymm2, ymm6                    ; ln_pp = C1 + C2*log1p
-    
-    ;--------------------------------------------------------------------------
-    ; exp(ln_pp) with CORRECT 2^k reconstruction
-    ;--------------------------------------------------------------------------
-    
-    ; Clamp input to [-700, 700]
-    vmaxpd      ymm1, ymm1, [rel exp_min_x]
-    vminpd      ymm1, ymm1, [rel exp_max_x]
-    
-    ; t = ln_pp * log2(e)
-    vmulpd      ymm5, ymm1, [rel exp_inv_ln2]
-    
-    ; k = round(t), f = t - k
-    vroundpd    ymm6, ymm5, 0                       ; k = round(t)
-    vsubpd      ymm5, ymm5, ymm6                    ; f = t - k
-    
-    ; 2^f via ESTRIN'S SCHEME (reduced dependency depth)
-    ;
-    ; Level 1 (parallel - 3 independent FMAs):
-    ;   p01 = 1 + f*c1
-    ;   p23 = c2 + f*c3
-    ;   p45 = c4 + f*c5
-    ;
-    ; Level 2:
-    ;   f2 = f*f
-    ;   q0123 = p01 + f2*p23
-    ;   q456 = p45 + f2*c6
-    ;
-    ; Level 3:
-    ;   f4 = f2*f2
-    ;   result = q0123 + f4*q456
-    ;
-    ; Dependency depth: 4 FMAs instead of 7 (Horner)
-    
-    ; Level 1: compute p01, p23, p45 in parallel
-    vmovapd     ymm7, [rel const_one]
-    vfmadd231pd ymm7, ymm5, [rel exp_c1]            ; p01 = 1 + f*c1
-    
-    vmovapd     ymm0, [rel exp_c2]
-    vfmadd231pd ymm0, ymm5, [rel exp_c3]            ; p23 = c2 + f*c3
-    
-    vmovapd     ymm1, [rel exp_c4]
-    vfmadd231pd ymm1, ymm5, [rel exp_c5]            ; p45 = c4 + f*c5
-    
-    ; Level 2: f2, then combine pairs
-    vmulpd      ymm2, ymm5, ymm5                    ; f2 = f*f
-    vfmadd231pd ymm7, ymm2, ymm0                    ; q0123 = p01 + f2*p23
-    vfmadd231pd ymm1, ymm2, [rel exp_c6]            ; q456 = p45 + f2*c6
-    
-    ; Level 3: f4, then final result
-    vmulpd      ymm2, ymm2, ymm2                    ; f4 = f2*f2
-    vfmadd231pd ymm7, ymm2, ymm1                    ; result = q0123 + f4*q456
-    ; ymm7 now contains 2^f
-    
-    ;--------------------------------------------------------------------------
-    ; CORRECT 2^k reconstruction (IEEE-754 compliant)
-    ;
-    ; A double 2^k has: sign=0, mantissa=0, exponent=(k+1023)
-    ; So the bit pattern is simply: (k + 1023) << 52
-    ;
-    ; Steps:
-    ; 1. Convert double k to int32 (k is in valid range)
-    ; 2. Sign-extend int32 to int64
-    ; 3. Add bias 1023
-    ; 4. Shift to exponent position
-    ;--------------------------------------------------------------------------
-    vcvtpd2dq   xmm0, ymm6                          ; 4 doubles -> 4 int32 in xmm0
-    vpmovsxdq   ymm0, xmm0                          ; sign-extend to 4 int64
-    vpaddq      ymm0, ymm0, [rel bias_1023]         ; add exponent bias
-    vpsllq      ymm0, ymm0, 52                      ; shift to exponent field
-    ; ymm0 now contains exact 2^k bit patterns
-    
-    ; pp = 2^f * 2^k
-    vmulpd      ymm7, ymm7, ymm0                    ; pp = exp(ln_pp)
-    
-    ; Clamp pp to minimum
-    vmaxpd      ymm7, ymm7, [rel const_min_pp]
-    
-    ; growth = pp * r_old * (1-h)
-    vmulpd      ymm0, ymm7, ymm4                    ; pp * r_old
-    vmulpd      ymm0, ymm0, ymm10                   ; * (1-h)
-    
-    ; r0 += pp * r_old * h
-    vmulpd      ymm1, ymm7, ymm4
-    vfmadd231pd ymm12, ymm1, ymm9                   ; r0 += pp * r_old * h
-    
-    ; Store growth to r_new[i+1..i+4]
-    vmovupd     [r13 + rsi*8 + 8], ymm0
-    
-    ;--------------------------------------------------------------------------
-    ; Block A: Truncation tracking (find highest index above threshold)
-    ;--------------------------------------------------------------------------
-    vcmppd      ymm1, ymm0, ymm11, 14               ; growth > thresh? (14 = GT)
-    vmovmskpd   eax, ymm1
-    
-    test        eax, eax
-    jz          .skip_trunc_a
-    
-    ; Find highest set bit -> highest valid index
-    ; Bit 3 = lane 3 = index i+4
-    ; Bit 0 = lane 0 = index i+1
-    bt          eax, 3
-    jc          .last_valid_a4
-    bt          eax, 2
-    jc          .last_valid_a3
-    bt          eax, 1
-    jc          .last_valid_a2
-    ; bit 0 must be set
-    lea         rbx, [rsi + 1]
-    jmp         .skip_trunc_a
-.last_valid_a4:
-    lea         rbx, [rsi + 4]
-    jmp         .skip_trunc_a
-.last_valid_a3:
-    lea         rbx, [rsi + 3]
-    jmp         .skip_trunc_a
-.last_valid_a2:
-    lea         rbx, [rsi + 2]
-.skip_trunc_a:
-    
-    ;--------------------------------------------------------------------------
-    ; Block A: MAX tracking (correct per-block accumulator with index)
-    ;
-    ; We maintain max_growth_A (ymm13) and max_idx_A (ymm15).
-    ; For each lane where growth > current max, update both value and index.
-    ; This matches the C version exactly.
-    ;--------------------------------------------------------------------------
-    
-    ; Build index vector for block A: [i+1, i+2, i+3, i+4]
-    ; Convert loop counter to double, then add offsets
-    vcvtsi2sd   xmm1, xmm1, rsi                     ; convert i to double
-    vbroadcastsd ymm1, xmm1                         ; broadcast i
-    vaddpd      ymm2, ymm1, [rel idx_offset_a]      ; ymm2 = [i+1, i+2, i+3, i+4]
-    
-    ; Compare growth_a > max_growth_A
-    vcmppd      ymm1, ymm0, ymm13, 14               ; ymm1 = mask where growth > max
-    
-    ; Blend in new maxima where mask is set
-    vblendvpd   ymm13, ymm13, ymm0, ymm1            ; max_growth_A = blend(old, growth, mask)
-    vblendvpd   ymm15, ymm15, ymm2, ymm1            ; max_idx_A = blend(old, indices, mask)
-    
-    ;==========================================================================
-    ; Block B: indices i+4 to i+7 (writes to r_new[i+5..i+8])
-    ;==========================================================================
-    
-    ; Load data for block B
-    vmovapd     ymm0, [r8  + rsi*8 + 32]            ; lin_mu[i+4..i+7]
-    vmovapd     ymm1, [r9  + rsi*8 + 32]            ; lin_C1[i+4..i+7]
-    vmovapd     ymm2, [r10 + rsi*8 + 32]            ; lin_C2[i+4..i+7]
-    vmovapd     ymm3, [r11 + rsi*8 + 32]            ; lin_inv_ssn[i+4..i+7]
-    vmovapd     ymm4, [r12 + rsi*8 + 32]            ; r_old[i+4..i+7]
-    
-    ; Compute z² = (x - μ)²
+    ; z² = (x - μ)²
     vsubpd      ymm5, ymm8, ymm0
     vmulpd      ymm5, ymm5, ymm5
     
-    ; t = z² * inv_sigma_sq_nu
+    ; t = z² * inv_ssn
     vmulpd      ymm5, ymm5, ymm3
     
-    ; log1p(t)
+    ; log1p(t) via Horner
     vmovapd     ymm6, [rel log1p_c6]
     vfmadd213pd ymm6, ymm5, [rel log1p_c5]
     vfmadd213pd ymm6, ymm5, [rel log1p_c4]
     vfmadd213pd ymm6, ymm5, [rel log1p_c3]
     vfmadd213pd ymm6, ymm5, [rel log1p_c2]
-    vfmadd213pd ymm6, ymm5, [rel log1p_c1]
+    vfmadd213pd ymm6, ymm5, [rel const_one]
     vmulpd      ymm6, ymm6, ymm5
     
-    ; ln_pp = C1 + C2 * log1p(t)
-    vfmadd231pd ymm1, ymm2, ymm6
+    ; ln_pp = C1 - C2 * log1p(t)
+    vfnmadd231pd ymm1, ymm2, ymm6
     
     ; exp(ln_pp) - clamp
     vmaxpd      ymm1, ymm1, [rel exp_min_x]
     vminpd      ymm1, ymm1, [rel exp_max_x]
-    
-    ; t = ln_pp * log2(e)
     vmulpd      ymm5, ymm1, [rel exp_inv_ln2]
-    
-    ; k = round(t), f = t - k
     vroundpd    ymm6, ymm5, 0
     vsubpd      ymm5, ymm5, ymm6
     
-    ; 2^f via ESTRIN'S SCHEME for Block B
-    ; (Same structure as Block A - reduced dependency depth)
-    
-    ; Level 1: p01, p23, p45 in parallel
+    ; Estrin's scheme for 2^f
     vmovapd     ymm7, [rel const_one]
-    vfmadd231pd ymm7, ymm5, [rel exp_c1]            ; p01 = 1 + f*c1
-    
+    vfmadd231pd ymm7, ymm5, [rel exp_c1]
     vmovapd     ymm0, [rel exp_c2]
-    vfmadd231pd ymm0, ymm5, [rel exp_c3]            ; p23 = c2 + f*c3
-    
+    vfmadd231pd ymm0, ymm5, [rel exp_c3]
     vmovapd     ymm1, [rel exp_c4]
-    vfmadd231pd ymm1, ymm5, [rel exp_c5]            ; p45 = c4 + f*c5
+    vfmadd231pd ymm1, ymm5, [rel exp_c5]
+    vmulpd      ymm2, ymm5, ymm5
+    vfmadd231pd ymm7, ymm2, ymm0
+    vfmadd231pd ymm1, ymm2, [rel exp_c6]
+    vmulpd      ymm2, ymm2, ymm2
+    vfmadd231pd ymm7, ymm2, ymm1
     
-    ; Level 2: f2, combine pairs
-    vmulpd      ymm2, ymm5, ymm5                    ; f2 = f*f
-    vfmadd231pd ymm7, ymm2, ymm0                    ; q0123 = p01 + f2*p23
-    vfmadd231pd ymm1, ymm2, [rel exp_c6]            ; q456 = p45 + f2*c6
-    
-    ; Level 3: f4, final result
-    vmulpd      ymm2, ymm2, ymm2                    ; f4 = f2*f2
-    vfmadd231pd ymm7, ymm2, ymm1                    ; result = q0123 + f4*q456
-    
-    ; CORRECT 2^k reconstruction for block B
+    ; 2^k reconstruction
     vcvtpd2dq   xmm0, ymm6
     vpmovsxdq   ymm0, xmm0
     vpaddq      ymm0, ymm0, [rel bias_1023]
@@ -440,72 +289,143 @@ bocpd_kernel_avx2:
     vmulpd      ymm7, ymm7, ymm0
     vmaxpd      ymm7, ymm7, [rel const_min_pp]
     
-    ; growth = pp * r_old * (1-h)
+    ; BOCPD update
     vmulpd      ymm0, ymm7, ymm4
-    vmulpd      ymm0, ymm0, ymm10
+    vmulpd      ymm1, ymm0, ymm10                   ; growth_a
+    vmulpd      ymm0, ymm0, ymm9                    ; change_a
     
-    ; r0 += pp * r_old * h
-    vmulpd      ymm1, ymm7, ymm4
-    vfmadd231pd ymm12, ymm1, ymm9
+    vmovupd     [r13 + rsi*8 + 8], ymm1
+    vaddpd      ymm12, ymm12, ymm0
     
-    ; Store growth to r_new[i+5..i+8]
-    vmovupd     [r13 + rsi*8 + 40], ymm0
+    ; MAX tracking A
+    vcmppd      ymm0, ymm1, ymm13, 14
+    vblendvpd   ymm13, ymm13, ymm1, ymm0
+    vmovapd     ymm2, [rsp + 96]
+    vblendvpd   ymm2, ymm2, ymm15, ymm0
+    vmovapd     [rsp + 96], ymm2
     
-    ;--------------------------------------------------------------------------
-    ; Block B: Truncation tracking
-    ;--------------------------------------------------------------------------
-    vcmppd      ymm1, ymm0, ymm11, 14
-    vmovmskpd   eax, ymm1
+    ; Truncation A
+    vcmppd      ymm0, ymm1, ymm11, 14
+    vmovmskpd   eax, ymm0
+    test        eax, eax
+    jz          .skip_trunc_a
+    bt          eax, 3
+    jc          .lv_a4
+    bt          eax, 2
+    jc          .lv_a3
+    bt          eax, 1
+    jc          .lv_a2
+    lea         rbx, [rsi + 1]
+    jmp         .skip_trunc_a
+.lv_a4:
+    lea         rbx, [rsi + 4]
+    jmp         .skip_trunc_a
+.lv_a3:
+    lea         rbx, [rsi + 3]
+    jmp         .skip_trunc_a
+.lv_a2:
+    lea         rbx, [rsi + 2]
+.skip_trunc_a:
     
+    ;==========================================================================
+    ; Block B: indices i+4 to i+7
+    ; Base offset = (i/4 + 1) * 128 = i*32 + 128
+    ;==========================================================================
+    
+    mov         rax, rsi
+    shl         rax, 5
+    add         rax, 128
+    
+    vmovapd     ymm0, [r8 + rax]
+    vmovapd     ymm1, [r8 + rax + 32]
+    vmovapd     ymm2, [r8 + rax + 64]
+    vmovapd     ymm3, [r8 + rax + 96]
+    vmovapd     ymm4, [r12 + rsi*8 + 32]
+    
+    vsubpd      ymm5, ymm8, ymm0
+    vmulpd      ymm5, ymm5, ymm5
+    vmulpd      ymm5, ymm5, ymm3
+    
+    vmovapd     ymm6, [rel log1p_c6]
+    vfmadd213pd ymm6, ymm5, [rel log1p_c5]
+    vfmadd213pd ymm6, ymm5, [rel log1p_c4]
+    vfmadd213pd ymm6, ymm5, [rel log1p_c3]
+    vfmadd213pd ymm6, ymm5, [rel log1p_c2]
+    vfmadd213pd ymm6, ymm5, [rel const_one]
+    vmulpd      ymm6, ymm6, ymm5
+    
+    vfnmadd231pd ymm1, ymm2, ymm6
+    
+    vmaxpd      ymm1, ymm1, [rel exp_min_x]
+    vminpd      ymm1, ymm1, [rel exp_max_x]
+    vmulpd      ymm5, ymm1, [rel exp_inv_ln2]
+    vroundpd    ymm6, ymm5, 0
+    vsubpd      ymm5, ymm5, ymm6
+    
+    vmovapd     ymm7, [rel const_one]
+    vfmadd231pd ymm7, ymm5, [rel exp_c1]
+    vmovapd     ymm0, [rel exp_c2]
+    vfmadd231pd ymm0, ymm5, [rel exp_c3]
+    vmovapd     ymm1, [rel exp_c4]
+    vfmadd231pd ymm1, ymm5, [rel exp_c5]
+    vmulpd      ymm2, ymm5, ymm5
+    vfmadd231pd ymm7, ymm2, ymm0
+    vfmadd231pd ymm1, ymm2, [rel exp_c6]
+    vmulpd      ymm2, ymm2, ymm2
+    vfmadd231pd ymm7, ymm2, ymm1
+    
+    vcvtpd2dq   xmm0, ymm6
+    vpmovsxdq   ymm0, xmm0
+    vpaddq      ymm0, ymm0, [rel bias_1023]
+    vpsllq      ymm0, ymm0, 52
+    
+    vmulpd      ymm7, ymm7, ymm0
+    vmaxpd      ymm7, ymm7, [rel const_min_pp]
+    
+    vmulpd      ymm0, ymm7, ymm4
+    vmulpd      ymm1, ymm0, ymm10
+    vmulpd      ymm0, ymm0, ymm9
+    
+    vmovupd     [r13 + rsi*8 + 40], ymm1
+    vaddpd      ymm12, ymm12, ymm0
+    
+    ; MAX tracking B
+    vcmppd      ymm0, ymm1, ymm14, 14
+    vblendvpd   ymm14, ymm14, ymm1, ymm0
+    vmovapd     ymm2, [rsp]
+    vmovapd     ymm3, [rsp + 160]
+    vblendvpd   ymm2, ymm2, ymm3, ymm0
+    vmovapd     [rsp], ymm2
+    
+    ; Truncation B
+    vcmppd      ymm0, ymm1, ymm11, 14
+    vmovmskpd   eax, ymm0
     test        eax, eax
     jz          .skip_trunc_b
-    
     bt          eax, 3
-    jc          .last_valid_b8
+    jc          .lv_b8
     bt          eax, 2
-    jc          .last_valid_b7
+    jc          .lv_b7
     bt          eax, 1
-    jc          .last_valid_b6
+    jc          .lv_b6
     lea         rbx, [rsi + 5]
     jmp         .skip_trunc_b
-.last_valid_b8:
+.lv_b8:
     lea         rbx, [rsi + 8]
     jmp         .skip_trunc_b
-.last_valid_b7:
+.lv_b7:
     lea         rbx, [rsi + 7]
     jmp         .skip_trunc_b
-.last_valid_b6:
+.lv_b6:
     lea         rbx, [rsi + 6]
 .skip_trunc_b:
     
-    ;--------------------------------------------------------------------------
-    ; Block B: MAX tracking (correct per-block accumulator with index)
-    ;
-    ; We maintain max_growth_B (ymm14) and max_idx_B (on stack).
-    ; For each lane where growth > current max, update both value and index.
-    ;--------------------------------------------------------------------------
+    ; Update running index vectors
+    vaddpd      ymm15, ymm15, [rel idx_increment]
+    vmovapd     ymm0, [rsp + 160]
+    vaddpd      ymm0, ymm0, [rel idx_increment]
+    vmovapd     [rsp + 160], ymm0
     
-    ; Build index vector for block B: [i+5, i+6, i+7, i+8]
-    vcvtsi2sd   xmm1, xmm1, rsi
-    vbroadcastsd ymm1, xmm1
-    vaddpd      ymm2, ymm1, [rel idx_offset_b]      ; ymm2 = [i+5, i+6, i+7, i+8]
-    
-    ; Load current max_idx_B from stack
-    vmovapd     ymm3, [rsp]                         ; ymm3 = max_idx_B
-    
-    ; Compare growth_b > max_growth_B
-    vcmppd      ymm1, ymm0, ymm14, 14               ; ymm1 = mask where growth > max
-    
-    ; Blend in new maxima where mask is set
-    vblendvpd   ymm14, ymm14, ymm0, ymm1            ; max_growth_B = blend(old, growth, mask)
-    vblendvpd   ymm3, ymm3, ymm2, ymm1              ; max_idx_B = blend(old, indices, mask)
-    
-    ; Store updated max_idx_B back to stack
-    vmovapd     [rsp], ymm3
-    
-    ;--------------------------------------------------------------------------
-    ; Loop increment
-    ;--------------------------------------------------------------------------
     add         rsi, 8
     jmp         .loop
     
@@ -515,88 +435,54 @@ bocpd_kernel_avx2:
     ; Horizontal reductions
     ;==========================================================================
     
-    ;--------------------------------------------------------------------------
-    ; Horizontal sum of r0 accumulator (ymm12)
-    ;--------------------------------------------------------------------------
+    ; r0 sum
     vextractf128 xmm0, ymm12, 1
     vaddpd      xmm0, xmm0, xmm12
     vhaddpd     xmm0, xmm0, xmm0
-    
-    ; Store r0
     mov         rax, [rdi + ARG_R0_OUT]
     vmovsd      [rax], xmm0
     
-    ; Save r0 value for MAP comparison
-    vmovsd      xmm6, xmm0, xmm0                    ; xmm6 = r0 (best value so far)
-    xor         r15, r15                             ; r15 = 0 (best index so far)
+    vmovsd      xmm6, xmm0, xmm0
+    xor         r15, r15
     
-    ;--------------------------------------------------------------------------
-    ; Horizontal reduction for MAP: find global max across both blocks
-    ;
-    ; We have:
-    ;   ymm13 = max_growth_A (4 lanes)
-    ;   ymm14 = max_growth_B (4 lanes)
-    ;   ymm15 = max_idx_A (4 lanes, as doubles)
-    ;   [rsp] = max_idx_B (4 lanes, as doubles)
-    ;
-    ; Must compare all 8 lanes to find global maximum, matching C version.
-    ;--------------------------------------------------------------------------
+    ; Store max vectors for reduction
+    vmovapd     [rsp + 32], ymm13
+    vmovapd     [rsp + 64], ymm14
     
-    ; Store all to stack for scalar reduction
-    vmovapd     [rsp + 32], ymm13                   ; max_growth_A
-    vmovapd     [rsp + 64], ymm14                   ; max_growth_B
-    vmovapd     [rsp + 96], ymm15                   ; max_idx_A
-    ; max_idx_B already at [rsp]
-    
-    ; Scalar loop: compare all 8 lanes to find global max
-    ; This matches the C version exactly
-    xor         rcx, rcx                             ; j = 0
-    
+    xor         rcx, rcx
 .reduce_loop:
     cmp         rcx, 4
     jge         .reduce_done
     
-    ; Check max_growth_A[j]
-    vmovsd      xmm1, [rsp + 32 + rcx*8]            ; max_growth_A[j]
-    vucomisd    xmm1, xmm6                          ; compare to best
+    vmovsd      xmm1, [rsp + 32 + rcx*8]
+    vucomisd    xmm1, xmm6
     jbe         .check_b
-    
-    vmovsd      xmm6, xmm1, xmm1                    ; update best value
-    vmovsd      xmm2, [rsp + 96 + rcx*8]            ; max_idx_A[j]
-    vcvttsd2si  r15, xmm2                           ; update best index
+    vmovsd      xmm6, xmm1, xmm1
+    vmovsd      xmm2, [rsp + 96 + rcx*8]
+    vcvttsd2si  r15, xmm2
     
 .check_b:
-    ; Check max_growth_B[j]
-    vmovsd      xmm1, [rsp + 64 + rcx*8]            ; max_growth_B[j]
-    vucomisd    xmm1, xmm6                          ; compare to best
+    vmovsd      xmm1, [rsp + 64 + rcx*8]
+    vucomisd    xmm1, xmm6
     jbe         .next_j
-    
-    vmovsd      xmm6, xmm1, xmm1                    ; update best value
-    vmovsd      xmm2, [rsp + rcx*8]                 ; max_idx_B[j]
-    vcvttsd2si  r15, xmm2                           ; update best index
+    vmovsd      xmm6, xmm1, xmm1
+    vmovsd      xmm2, [rsp + rcx*8]
+    vcvttsd2si  r15, xmm2
     
 .next_j:
     inc         rcx
     jmp         .reduce_loop
     
 .reduce_done:
-    ; Store max_growth
     mov         rax, [rdi + ARG_MAX_GROWTH]
     vmovsd      [rax], xmm6
-    
-    ; Store max_idx
     mov         rax, [rdi + ARG_MAX_IDX]
     mov         [rax], r15
-    
-    ; Store last_valid
     mov         rax, [rdi + ARG_LAST_VALID]
     mov         [rax], rbx
     
     ;--------------------------------------------------------------------------
-    ; Epilogue with correct stack restoration
-    ;
-    ; Restore RSP from RBP (undoes alignment and local allocation),
-    ; then pop callee-saved registers in reverse order.
+    ; Epilogue
     ;--------------------------------------------------------------------------
     mov         rsp, rbp
     pop         r15
