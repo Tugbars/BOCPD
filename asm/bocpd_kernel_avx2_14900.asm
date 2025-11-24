@@ -480,3 +480,109 @@ bocpd_fused_loop_avx2:
     lea rbx, [rsi + 6]
 
 .skip_trunc_B:
+
+; =============================================================================
+;   LOOP END — REDUCTIONS AND OUTPUTS
+; =============================================================================
+
+.loop_end:
+
+; ============================================================================
+;   REDUCE r0 ACCUMULATOR  (ymm23 holds 4 partial sums)
+; ============================================================================
+    vextractf128 xmm0, ymm23, 1      ; high 128
+    vaddpd       xmm0, xmm0, xmm23   ; add low 128
+    vhaddpd      xmm0, xmm0, xmm0    ; horizontal add → [sum, sum]
+    mov          rax, [rdi + ARG_R0_OUT]
+    vmovsd       [rax], xmm0
+
+
+; Store r0 also into xmm6 so we can compare max-growth against r0.
+    vmovsd       xmm6, xmm0, xmm0
+
+
+; ============================================================================
+;   PREPARE REDUCTION FOR MAX GROWTH
+; ============================================================================
+; We saved:
+;   max_growth_A → [rsp+32]
+;   max_growth_B → [rsp+64]
+;   max_idx_A    → [rsp+96]
+;   max_idx_B    → [rsp]
+
+    vmovapd      [rsp + 32], ymm13     ; (A)
+    vmovapd      [rsp + 64], ymm14     ; (B)
+
+    xor     rcx, rcx                   ; loop counter
+    xor     r15, r15                   ; final MAP index
+
+.reduce_loop:
+
+    cmp rcx, 4
+    jge .reduce_done
+
+; ------------------------
+; Compare A-lane j
+; ------------------------
+    vmovsd xmm1, [rsp + 32 + rcx*8]     ; growth_A[j]
+    vucomisd xmm1, xmm6
+    jbe .check_b
+
+    ; A[j] > current max → update
+    vmovsd xmm6, xmm1
+    vmovsd xmm2, [rsp + 96 + rcx*8]     ; idx_A[j]
+    vcvttsd2si r15, xmm2
+
+.check_b:
+; ------------------------
+; Compare B-lane j
+; ------------------------
+    vmovsd xmm1, [rsp + 64 + rcx*8]     ; growth_B[j]
+    vucomisd xmm1, xmm6
+    jbe .next_j
+
+    ; B[j] > current max → update
+    vmovsd xmm6, xmm1
+    vmovsd xmm2, [rsp + rcx*8]          ; idx_B[j]
+    vcvttsd2si r15, xmm2
+
+.next_j:
+    inc rcx
+    jmp .reduce_loop
+
+.reduce_done:
+
+; ============================================================================
+;   WRITE max_growth_out
+; ============================================================================
+    mov rax, [rdi + ARG_MAX_GROWTH]
+    vmovsd [rax], xmm6
+
+; ============================================================================
+;   WRITE max_idx_out
+; ============================================================================
+    mov rax, [rdi + ARG_MAX_IDX]
+    mov [rax], r15
+
+; ============================================================================
+;   WRITE last_valid_out
+; ============================================================================
+    mov rax, [rdi + ARG_LAST_VALID]
+    mov [rax], rbx
+
+
+; =============================================================================
+;   EPILOGUE
+; =============================================================================
+    mov rsp, rbp
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+
+    vzeroupper
+    ret
+
