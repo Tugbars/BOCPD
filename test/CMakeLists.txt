@@ -167,24 +167,6 @@ if(UNIX OR MINGW)
     target_link_libraries(test_bocpd_fast PRIVATE m)
 endif()
 
-# Scalar test (standalone scalar version test)
-add_executable(test_bocpd_scalar
-    ${TEST_DIR}/test_bocpd_scalar.c
-)
-
-target_link_libraries(test_bocpd_scalar PRIVATE bocpd_scalar)
-target_include_directories(test_bocpd_scalar PRIVATE ${SCALAR_DIR})
-target_compile_options(test_bocpd_scalar PRIVATE ${BOCPD_COMPILE_FLAGS})
-target_compile_definitions(test_bocpd_scalar PRIVATE STANDALONE)
-
-if(WIN32 AND MINGW)
-    target_link_options(test_bocpd_scalar PRIVATE -mconsole)
-endif()
-
-if(UNIX OR MINGW)
-    target_link_libraries(test_bocpd_scalar PRIVATE m)
-endif()
-
 #===============================================================================
 # CTest Integration
 #===============================================================================
@@ -193,11 +175,9 @@ enable_testing()
 
 add_test(NAME Benchmark COMMAND bocpd_bench)
 add_test(NAME FastASM COMMAND test_bocpd_fast)
-add_test(NAME Scalar COMMAND test_bocpd_scalar)
 
 set_tests_properties(Benchmark PROPERTIES TIMEOUT 120)
 set_tests_properties(FastASM PROPERTIES TIMEOUT 60)
-set_tests_properties(Scalar PROPERTIES TIMEOUT 60)
 
 #===============================================================================
 # Custom Targets
@@ -206,7 +186,7 @@ set_tests_properties(Scalar PROPERTIES TIMEOUT 60)
 # Run all tests
 add_custom_target(run_tests
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS bocpd_bench test_bocpd_fast test_bocpd_scalar
+    DEPENDS bocpd_bench test_bocpd_fast
     COMMENT "Running all BOCPD tests..."
 )
 
@@ -222,13 +202,6 @@ add_custom_target(run_fast
     COMMAND test_bocpd_fast
     DEPENDS test_bocpd_fast
     COMMENT "Running ASM kernel tests..."
-)
-
-# Run scalar tests
-add_custom_target(run_scalar
-    COMMAND test_bocpd_scalar
-    DEPENDS test_bocpd_scalar
-    COMMENT "Running scalar implementation tests..."
 )
 
 #===============================================================================
@@ -282,13 +255,11 @@ message(STATUS "")
 message(STATUS "Test targets:")
 message(STATUS "  bocpd_bench      - Benchmark (scalar vs ASM)")
 message(STATUS "  test_bocpd_fast  - ASM kernel tests")
-message(STATUS "  test_bocpd_scalar - Scalar implementation tests")
 message(STATUS "")
 message(STATUS "Custom targets (make <target>):")
 message(STATUS "  run_tests        - Run all tests via CTest")
 message(STATUS "  run_bench        - Run benchmark only")
 message(STATUS "  run_fast         - Run ASM tests only")
-message(STATUS "  run_scalar       - Run scalar tests only")
 message(STATUS "")
 message(STATUS "Build with Intel-tuned kernel:")
 message(STATUS "  cmake -DBOCPD_KERNEL_VARIANT=1 ..")
