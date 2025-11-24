@@ -70,22 +70,40 @@ add_custom_command(
     COMMENT "Assembling generic AVX2 kernel..."
 )
 
-# Custom command to assemble Intel-tuned kernel
-set(ASM_KERNEL_INTEL_SRC ${ASM_DIR}/bocpd_kernel_avx2_intel.asm)
-set(ASM_KERNEL_INTEL_OBJ ${CMAKE_CURRENT_BINARY_DIR}/bocpd_kernel_avx2_intel.o)
+# Intel kernel is optional - only build if file exists
+set(ASM_KERNEL_INTEL_SRC ${ASM_DIR}/bocpd_avx2_kernel_intel.asm)
+set(ASM_KERNEL_INTEL_OBJ ${CMAKE_CURRENT_BINARY_DIR}/bocpd_avx2_kernel_intel.o)
 
-add_custom_command(
-    OUTPUT ${ASM_KERNEL_INTEL_OBJ}
-    COMMAND ${NASM_EXECUTABLE} -f ${NASM_FORMAT} -o ${ASM_KERNEL_INTEL_OBJ} ${ASM_KERNEL_INTEL_SRC}
-    DEPENDS ${ASM_KERNEL_INTEL_SRC}
-    COMMENT "Assembling Intel-tuned AVX2 kernel..."
-)
+if(EXISTS ${ASM_KERNEL_INTEL_SRC})
+    add_custom_command(
+        OUTPUT ${ASM_KERNEL_INTEL_OBJ}
+        COMMAND ${NASM_EXECUTABLE} -f ${NASM_FORMAT} -o ${ASM_KERNEL_INTEL_OBJ} ${ASM_KERNEL_INTEL_SRC}
+        DEPENDS ${ASM_KERNEL_INTEL_SRC}
+        COMMENT "Assembling Intel-tuned AVX2 kernel..."
+    )
+    set(HAVE_INTEL_KERNEL TRUE)
+    message(STATUS "Intel-tuned kernel: FOUND")
+else()
+    set(HAVE_INTEL_KERNEL FALSE)
+    message(STATUS "Intel-tuned kernel: NOT FOUND (using generic only)")
+    # Force generic kernel if Intel not available
+    if(BOCPD_KERNEL_VARIANT EQUAL 1)
+        message(WARNING "Intel kernel requested but not found, falling back to generic")
+        set(BOCPD_KERNEL_VARIANT 0)
+    endif()
+endif()
 
 # Custom target for assembly objects
-add_custom_target(asm_kernels DEPENDS 
-    ${ASM_KERNEL_GENERIC_OBJ} 
-    ${ASM_KERNEL_INTEL_OBJ}
-)
+if(HAVE_INTEL_KERNEL)
+    add_custom_target(asm_kernels DEPENDS 
+        ${ASM_KERNEL_GENERIC_OBJ} 
+        ${ASM_KERNEL_INTEL_OBJ}
+    )
+else()
+    add_custom_target(asm_kernels DEPENDS 
+        ${ASM_KERNEL_GENERIC_OBJ}
+    )
+endif()
 
 #===============================================================================
 # Scalar Library (Optimized, No SIMD)
