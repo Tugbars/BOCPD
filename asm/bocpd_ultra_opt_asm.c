@@ -1,5 +1,5 @@
 /**
- * @file bocpd_ultra_opt.c
+ * @file bocpd_ultra_opt_asm.c
  * @brief Ultra-optimized BOCPD implementation with AVX2 SIMD (Optimized Version)
  *
  * @details This file contains the core computational routines for BOCPD,
@@ -58,6 +58,19 @@
 #include <immintrin.h>
 
 /*=============================================================================
+ * Platform-specific aligned allocation
+ *=============================================================================*/
+
+static inline void* aligned_calloc(size_t alignment, size_t size)
+{
+    void* ptr = aligned_alloc(alignment, size);
+    if (ptr) {
+        memset(ptr, 0, size);
+    }
+    return ptr;
+}
+
+/*=============================================================================
  * Compiler Hints and Constants
  *=============================================================================*/
 
@@ -67,10 +80,6 @@
 /** @brief Branch prediction hints. */
 #define LIKELY(x) __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
-
-/** @brief Mathematical constants (full double precision). */
-static const double LN_2 = 0.6931471805599453094172321214581766;
-static const double LN_PI = 1.1447298858494001741434273513530587;
 
 /*=============================================================================
  * Ring Buffer Helpers
@@ -156,7 +165,12 @@ static void linearize_ring(bocpd_asm_t *b)
     const size_t end = cap - start; /* Elements until wraparound */
 
     double *out = b->lin_interleaved;
-    size_t padded = (n + 7) & ~7ULL;
+    
+    /* 
+     * CRITICAL FIX: Pad to n_padded + 8 to ensure Block B in SIMD loop
+     * always has valid data to read, even if it's just zeros.
+     */
+    size_t padded = ((n + 7) & ~7ULL) + 8;
 
     /*
      * OPTIMIZED: Process 4 elements at a time using direct copies.
@@ -208,8 +222,9 @@ static void linearize_ring(bocpd_asm_t *b)
             }
             else
             {
+                /* Safe padding values that produce pp ≈ 0 */
                 out[base + 0 + j] = 0.0;
-                out[base + 4 + j] = -INFINITY;
+                out[base + 4 + j] = -INFINITY;  /* exp(-∞) = 0 */
                 out[base + 8 + j] = 1.0;
                 out[base + 12 + j] = 1.0;
             }
@@ -448,32 +463,6 @@ static inline void init_posterior_slot(bocpd_asm_t *b, size_t ri)
  * 4. Truncation boundary (last run with P > threshold) - NOW FUSED
  *
  * All operations are fused into a single pass with 2× loop unrolling.
- *
- * OPTIMIZATIONS APPLIED:
- * - Hoisted index offset vectors outside loop (was _mm256_set_epi64x per iter)
- * - Replaced floor(t+0.5) with _mm256_round_pd
- * - Fused truncation boundary search into main loop (eliminated second pass)
- * - Reduced memset to only needed entries
- * - Inlined polynomials for better cross-block ILP
- *
- * Loop structure (processing 8 run lengths per iteration):
- *
- *   for i in [0, n_padded) step 8:
- *       Block A (indices i+0 to i+3):
- *           load mu, C1, C2, inv_ssn, r_old
- *           z² = (x - μ)²
- *           t = z² · inv_ssn
- *           ln_pp = C1 - C2 · log1p(t)
- *           pp = exp(ln_pp)
- *           growth = r_old · pp · (1-h)
- *           change = r_old · pp · h
- *           store growth to r_new[i+1]
- *           accumulate change to r0
- *           update max tracking
- *           update truncation boundary (FUSED)
- *
- *       Block B (indices i+4 to i+7):
- *           [same operations]
  *=============================================================================*/
 
 /**
@@ -487,7 +476,7 @@ static inline void init_posterior_slot(bocpd_asm_t *b, size_t ri)
  * @post b->active_len, b->map_runlength updated
  *
  * @note 2× unrolled AVX2 loop, no scalar remainder (arrays padded)
- * @note All loads are aligned (_mm256_load_pd)
+ * @note All loads are aligned (_mm256_loadu_pd)
  */
 static void fused_step_simd(bocpd_asm_t *b, double x)
 {
@@ -516,20 +505,19 @@ static void fused_step_simd(bocpd_asm_t *b, double x)
      * The SIMD loop reads up to n_padded elements from r (r_old),
      * and elements beyond n should be zero to not contribute garbage.
      */
-    for (size_t i = n; i < n_padded; i++)
+    for (size_t i = n; i < n_padded + 8; i++)
     {
         r[i] = 0.0;
     }
 
     /*
-     * OPTIMIZATION: Only zero the entries we'll actually use.
-     * Previous version did memset on entire capacity which was wasteful.
-     * Use SIMD stores for faster zeroing.
-     * We need to zero up to n_padded + 8 because block B writes to i+5..i+8.
+     * CRITICAL FIX: Zero r_new up to n_padded + 16 to handle:
+     * - Block B writes to r_new[i+8] when i = n_padded - 8
+     * - Extra margin for safety
      */
     {
         __m256d zero = _mm256_setzero_pd();
-        for (size_t i = 0; i <= n_padded; i += 4)
+        for (size_t i = 0; i < n_padded + 16; i += 4)
         {
             _mm256_storeu_pd(&r_new[i], zero);
         }
@@ -741,11 +729,11 @@ static void fused_step_simd(bocpd_asm_t *b, double x)
         double *base_a = &b->lin_interleaved[block_a * 16];
 
         /* Aligned loads from interleaved buffer - all in 2 cache lines! */
-        __m256d mu_a = _mm256_load_pd(base_a + 0);       /* bytes 0-31 */
-        __m256d C1_a = _mm256_load_pd(base_a + 4);       /* bytes 32-63 */
-        __m256d C2_a = _mm256_load_pd(base_a + 8);       /* bytes 64-95 */
-        __m256d inv_ssn_a = _mm256_load_pd(base_a + 12); /* bytes 96-127 */
-        __m256d r_old_a = _mm256_load_pd(&r[i]);
+        __m256d mu_a = _mm256_loadu_pd(base_a + 0);       /* bytes 0-31 */
+        __m256d C1_a = _mm256_loadu_pd(base_a + 4);       /* bytes 32-63 */
+        __m256d C2_a = _mm256_loadu_pd(base_a + 8);       /* bytes 64-95 */
+        __m256d inv_ssn_a = _mm256_loadu_pd(base_a + 12); /* bytes 96-127 */
+        __m256d r_old_a = _mm256_loadu_pd(&r[i]);
 
         /*
          * Compute z² = (x - μ)².
@@ -912,11 +900,11 @@ static void fused_step_simd(bocpd_asm_t *b, double x)
         double *base_b = &b->lin_interleaved[block_b * 16];
 
         /* Aligned loads from interleaved buffer - all in 2 cache lines! */
-        __m256d mu_b = _mm256_load_pd(base_b + 0);
-        __m256d C1_b = _mm256_load_pd(base_b + 4);
-        __m256d C2_b = _mm256_load_pd(base_b + 8);
-        __m256d inv_ssn_b = _mm256_load_pd(base_b + 12);
-        __m256d r_old_b = _mm256_load_pd(&r[i + 4]);
+        __m256d mu_b = _mm256_loadu_pd(base_b + 0);
+        __m256d C1_b = _mm256_loadu_pd(base_b + 4);
+        __m256d C2_b = _mm256_loadu_pd(base_b + 8);
+        __m256d inv_ssn_b = _mm256_loadu_pd(base_b + 12);
+        __m256d r_old_b = _mm256_loadu_pd(&r[i + 4]);
 
         __m256d z_b = _mm256_sub_pd(x_vec, mu_b);
         __m256d z2_b = _mm256_mul_pd(z_b, z_b);
@@ -1029,12 +1017,12 @@ static void fused_step_simd(bocpd_asm_t *b, double x)
      * We have two __m256d with partial maxes. Need to find the
      * global maximum and its index.
      */
-    double ALIGN64 max_arr_a[4], max_arr_b[4];
-    int64_t ALIGN64 idx_arr_a[4], idx_arr_b[4];
-    _mm256_store_pd(max_arr_a, max_growth_a);
-    _mm256_store_pd(max_arr_b, max_growth_b);
-    _mm256_store_si256((__m256i *)idx_arr_a, max_idx_a);
-    _mm256_store_si256((__m256i *)idx_arr_b, max_idx_b);
+    double max_arr_a[4], max_arr_b[4];
+    int64_t idx_arr_a[4], idx_arr_b[4];
+    _mm256_storeu_pd(max_arr_a, max_growth_a);      // Unaligned store
+    _mm256_storeu_pd(max_arr_b, max_growth_b);
+    _mm256_storeu_si256((__m256i *)idx_arr_a, max_idx_a);
+    _mm256_storeu_si256((__m256i *)idx_arr_b, max_idx_b);
 
     double map_val = r0; /* r[0] is also a candidate */
     size_t map_idx = 0;
@@ -1195,49 +1183,57 @@ int bocpd_ultra_init(bocpd_asm_t *b, double hazard_lambda,
     size_t alloc = cap * sizeof(double);
 
     /*
-     * CRITICAL: r_scratch needs extra padding because the SIMD loop writes
-     * to r_new[i+1..i+8]. When i = n_padded - 8, we write up to index
-     * n_padded, which equals capacity. So we need capacity + 8 elements.
-     *
-     * Round up to multiple of 64 for aligned_alloc requirement.
+     * CRITICAL FIX: Need more padding for r and r_scratch!
+     * 
+     * Worst case analysis:
+     * - n_padded can equal cap (when active_len = cap)
+     * - Block B writes to r_new[i+8] when i = n_padded - 8
+     * - So we write to r_new[n_padded] = r_new[cap]
+     * - Zeroing loop also writes beyond n_padded
+     * 
+     * Safe allocation: cap + 32 elements (generous margin)
+     * Round up to multiple of 64 for alignment requirement.
      */
-    size_t alloc_scratch = ((cap + 8) * sizeof(double) + 63) & ~63ULL;
+    size_t alloc_scratch = ((cap + 32) * sizeof(double) + 63) & ~63ULL;
 
     /*
-     * Allocate all arrays with 64-byte alignment.
+     * CRITICAL FIX: Interleaved buffer needs more padding!
+     * 
+     * Block B accesses block index (i/4) + 1
+     * When i = n_padded - 8, block_b = n_padded/4 - 1
+     * But linearize_ring pads to n_padded + 8, so we need blocks for that.
+     * 
+     * Safe allocation: (cap + 32) / 4 blocks * 16 doubles per block
+     *                = (cap + 32) * 4 doubles
+     */
+    size_t alloc_interleaved = ((cap + 32) * 4 * sizeof(double) + 63) & ~63ULL;
+
+    /*
+     * Allocate all arrays with 64-byte alignment and zero-initialize.
      * This ensures:
      * - Cache line alignment (64 bytes on modern x86)
      * - AVX2 aligned load/store compatibility
      * - No false sharing between arrays
+     * - No garbage values
      */
 
     /* Ring-buffered arrays */
-    b->ss_n = aligned_alloc(64, alloc);
-    b->ss_sum = aligned_alloc(64, alloc);
-    b->ss_sum2 = aligned_alloc(64, alloc);
-    b->post_kappa = aligned_alloc(64, alloc);
-    b->post_mu = aligned_alloc(64, alloc);
-    b->post_alpha = aligned_alloc(64, alloc);
-    b->post_beta = aligned_alloc(64, alloc);
-    b->C1 = aligned_alloc(64, alloc);
-    b->C2 = aligned_alloc(64, alloc);
-    b->sigma_sq = aligned_alloc(64, alloc);
-    b->inv_sigma_sq_nu = aligned_alloc(64, alloc);
-    b->lgamma_alpha = aligned_alloc(64, alloc);
-    b->lgamma_alpha_p5 = aligned_alloc(64, alloc);
+    b->ss_n = aligned_calloc(64, alloc);
+    b->ss_sum = aligned_calloc(64, alloc);
+    b->ss_sum2 = aligned_calloc(64, alloc);
+    b->post_kappa = aligned_calloc(64, alloc);
+    b->post_mu = aligned_calloc(64, alloc);
+    b->post_alpha = aligned_calloc(64, alloc);
+    b->post_beta = aligned_calloc(64, alloc);
+    b->C1 = aligned_calloc(64, alloc);
+    b->C2 = aligned_calloc(64, alloc);
+    b->sigma_sq = aligned_calloc(64, alloc);
+    b->inv_sigma_sq_nu = aligned_calloc(64, alloc);
+    b->lgamma_alpha = aligned_calloc(64, alloc);
+    b->lgamma_alpha_p5 = aligned_calloc(64, alloc);
 
-    /*
-     * Interleaved linear buffer for SIMD.
-     *
-     * Layout: Each block of 4 elements contains [mu, C1, C2, inv_ssn]
-     * Block size: 4 fields × 4 elements × 8 bytes = 128 bytes = 2 cache lines
-     *
-     * For n_padded elements, we need n_padded/4 blocks × 128 bytes.
-     * With padding: (cap + 8) elements → (cap + 8)/4 blocks × 128 bytes
-     *             = (cap + 8) × 32 bytes = (cap + 8) × 4 × 8 bytes
-     */
-    size_t alloc_interleaved = ((cap + 8) * 4 * sizeof(double) + 63) & ~63ULL;
-    b->lin_interleaved = aligned_alloc(64, alloc_interleaved);
+    /* Interleaved linear buffer for SIMD */
+    b->lin_interleaved = aligned_calloc(64, alloc_interleaved);
 
     /* Legacy pointers no longer used - set to NULL */
     b->lin_mu = NULL;
@@ -1246,8 +1242,8 @@ int bocpd_ultra_init(bocpd_asm_t *b, double hazard_lambda,
     b->lin_inv_ssn = NULL;
 
     /* Run-length distribution - both need extra padding for SIMD operations */
-    b->r = aligned_alloc(64, alloc_scratch);
-    b->r_scratch = aligned_alloc(64, alloc_scratch);
+    b->r = aligned_calloc(64, alloc_scratch);
+    b->r_scratch = aligned_calloc(64, alloc_scratch);
 
     /* Check allocations */
     if (!b->ss_n || !b->ss_sum || !b->ss_sum2 || !b->post_kappa ||
@@ -1260,10 +1256,6 @@ int bocpd_ultra_init(bocpd_asm_t *b, double hazard_lambda,
         bocpd_ultra_free(b);
         return -1;
     }
-
-    /* Initialize run-length distribution to zero */
-    memset(b->r, 0, alloc);
-    memset(b->r_scratch, 0, alloc);
 
     b->t = 0;
     b->active_len = 0;
@@ -1373,4 +1365,4 @@ void bocpd_ultra_step(bocpd_asm_t *b, double x)
     {
         b->p_changepoint += b->r[i];
     }
-}
+}    
