@@ -86,83 +86,113 @@ typedef struct bocpd_prior {
  *=============================================================================*/
 
 /**
- * @brief BOCPD detector state (ASM-optimized version).
+ * @brief BOCPD detector state (ASM-optimized version, pool-friendly).
  *
- * All arrays are 64-byte aligned for AVX2/AVX-512.
- * Ring buffer with power-of-2 capacity for fast modular arithmetic.
+ * This structure holds all metadata and pointer slices into a single
+ * contiguous memory block (allocated per detector or via a global pool).
+ *
+ * All large arrays (r, posterior params, interleaved blocks, etc.)
+ * reside in one 64-byte aligned mega-block:
+ *
+ *   [ r | r_scratch | ss_n | ss_sum | ss_sum2 |
+ *     post_kappa | post_mu | post_alpha | post_beta |
+ *     C1 | C2 | sigma_sq | inv_sigma_sq_nu |
+ *     lgamma_alpha | lgamma_alpha_p5 |
+ *     lin_interleaved ]
+ *
+ * This allows:
+ *   - Extremely fast initialization (pointer slicing, no malloc)
+ *   - Perfect AVX2 alignment for the assembly kernel
+ *   - Ideal cache locality
+ *   - Zero heap fragmentation in multi-detector workloads
  */
+
 typedef struct bocpd_asm {
-    /*-------------------------------------------------------------------------
-     * Configuration
-     *-------------------------------------------------------------------------*/
-    size_t capacity;            /**< Max run lengths (power of 2) */
-    double hazard;              /**< Hazard rate h = 1/λ */
-    double one_minus_h;         /**< Precomputed 1-h */
-    double trunc_thresh;        /**< Truncation threshold (default 1e-12) */
-    bocpd_prior_t prior;        /**< Prior parameters */
 
-    /*-------------------------------------------------------------------------
-     * Ring buffer state
-     *-------------------------------------------------------------------------*/
-    size_t ring_start;          /**< Start index in ring buffer */
-    size_t active_len;          /**< Number of active run lengths */
+    /*=========================================================================
+     *  CONFIGURATION (rarely modified, read-only in the hot path)
+     *=========================================================================*/
+    size_t capacity;            //!< Max run length (power of 2, padded)
+    double hazard;              //!< Hazard rate h = 1/λ
+    double one_minus_h;         //!< Precomputed (1 - h)
+    double trunc_thresh;        //!< Truncation threshold (e.g., 1e-12)
+    bocpd_prior_t prior;        //!< Prior hyperparameters (κ₀, μ₀, α₀, β₀)
 
-    /*-------------------------------------------------------------------------
-     * Sufficient statistics (ring-buffered)
-     *-------------------------------------------------------------------------*/
-    double *ss_n;               /**< Count per run length */
-    double *ss_sum;             /**< Sum of observations per run */
-    double *ss_sum2;            /**< Sum of squared observations per run */
+    /*=========================================================================
+     *  RING-BUFFER STATE (lightweight scalars)
+     *=========================================================================*/
+    size_t ring_start;          //!< Start index of ring buffer (mod capacity)
+    size_t active_len;          //!< Current number of active run lengths
 
-    /*-------------------------------------------------------------------------
-     * Posterior parameters (ring-buffered)
-     *-------------------------------------------------------------------------*/
-    double *post_kappa;         /**< Posterior κ */
-    double *post_mu;            /**< Posterior μ */
-    double *post_alpha;         /**< Posterior α */
-    double *post_beta;          /**< Posterior β */
-
-    /*-------------------------------------------------------------------------
-     * Precomputed Student-t constants (ring-buffered)
-     *-------------------------------------------------------------------------*/
-    double *C1;                 /**< Log-pdf constant term */
-    double *C2;                 /**< Log-pdf coefficient (α + 0.5) */
-    double *sigma_sq;           /**< Scale parameter σ² */
-    double *inv_sigma_sq_nu;    /**< Precomputed 1/(σ²ν) */
-    double *lgamma_alpha;       /**< Cached lgamma(α) */
-    double *lgamma_alpha_p5;    /**< Cached lgamma(α + 0.5) */
-
-    /*-------------------------------------------------------------------------
-     * Interleaved scratch buffer (for ASM kernel)
+    /*=========================================================================
+     *  POINTERS INTO MEGA-BLOCK (ALL contiguous + 64-byte aligned)
      *
-     * Memory layout optimized for cache utilization:
-     *   Block k: [μ[4k:4k+3], C1[4k:4k+3], C2[4k:4k+3], inv_σ²ν[4k:4k+3]]
+     *  These pointers do NOT own memory. They point into a contiguous block
+     *  allocated once (per detector or from a slab allocator).
+     *=========================================================================*/
+
+    /*--- Sufficient statistics ----------------------------------------------*/
+    double *ss_n;               //!< Count of samples for each run length
+    double *ss_sum;             //!< Sum of x
+    double *ss_sum2;            //!< Sum of x²
+
+    /*--- Posterior parameters -----------------------------------------------*/
+    double *post_kappa;         //!< κ (precision scale)
+    double *post_mu;            //!< μ (posterior mean)
+    double *post_alpha;         //!< α (shape)
+    double *post_beta;          //!< β (rate)
+
+    /*--- Cached Student-t precomputations -----------------------------------*/
+    double *C1;                 //!< Log-pdf constant term (per run)
+    double *C2;                 //!< Coefficient for log1p term (α + 0.5)
+    double *sigma_sq;           //!< Posterior σ²
+    double *inv_sigma_sq_nu;    //!< Precomputed 1/(σ²·ν)
+    double *lgamma_alpha;       //!< Cached lgamma(α)
+    double *lgamma_alpha_p5;    //!< Cached lgamma(α + 0.5)
+
+    /*=========================================================================
+     *  INTERLEAVED BLOCK FOR ASM KERNEL
      *
-     * Each block = 128 bytes = 2 cache lines.
-     * Single memory stream enables efficient prefetching.
-     *-------------------------------------------------------------------------*/
-    double *lin_interleaved;    /**< Interleaved parameter blocks */
+     *  Layout per 4-run block (128 bytes):
+     *      μ[4] | C1[4] | C2[4] | inv_sigma_sq_nu[4]
+     *
+     *  This is the ONLY region the AVX2 kernel reads.
+     *  Must be 32-byte aligned (vmovapd).
+     *=========================================================================*/
+    double *lin_interleaved;    //!< Interleaved μ/C1/C2/inv blocks (AVX2)
+
+    /*--- Legacy linear views (refer into interleaved!) ----------------------*/
+    double *lin_mu;             //!< Linear μ
+    double *lin_C1;             //!< Linear C1
+    double *lin_C2;             //!< Linear C2
+    double *lin_inv_ssn;        //!< Linear inv_sigma_sq_nu
+
+    /*=========================================================================
+     *  RUN-LENGTH DISTRIBUTION (AVX2 kernel writes here)
+     *=========================================================================*/
+    double *r;                  //!< Current distribution P(r_t | x₁:t)
+    double *r_scratch;          //!< Temporary buffer for next-step distribution
+
+    /*=========================================================================
+     *  OUTPUT STATE (scalar result per update)
+     *=========================================================================*/
+    size_t t;                   //!< Current timestep
+    size_t map_runlength;       //!< MAP run-length index
+    double p_changepoint;       //!< Quick indicator P(r_t < 5)
+
+    /*=========================================================================
+     *  INTERNAL: POINTER TO MEGA-BLOCK
+     *
+     *  This is needed if you want a pool allocator or a single malloc
+     *  per detector. Freeing / pooling becomes trivial.
+     *=========================================================================*/
+    void *block;                //!< Base pointer of the mega-block (non-null)
 
     /*-------------------------------------------------------------------------
-     * Legacy pointers (for compatibility, point into lin_interleaved)
+     * Internal: pointer to mega-block (added for fast init/free)
      *-------------------------------------------------------------------------*/
-    double *lin_mu;             /**< Linearized posterior means (legacy) */
-    double *lin_C1;             /**< Linearized C1 constants (legacy) */
-    double *lin_C2;             /**< Linearized C2 constants (legacy) */
-    double *lin_inv_ssn;        /**< Linearized 1/(σ²ν) values (legacy) */
-
-    /*-------------------------------------------------------------------------
-     * Run-length distribution
-     *-------------------------------------------------------------------------*/
-    double *r;                  /**< Current distribution P(r_t | x_{1:t}) */
-    double *r_scratch;          /**< Scratch buffer for updates */
-
-    /*-------------------------------------------------------------------------
-     * Output state
-     *-------------------------------------------------------------------------*/
-    size_t t;                   /**< Current timestep */
-    size_t map_runlength;       /**< MAP estimate of run length */
-    double p_changepoint;       /**< P(r_t < 5) - quick changepoint indicator */
+    void *mega;                 /**< Base pointer of big contiguous block */
+    size_t mega_bytes;          /**< Total size of block */
 
 } bocpd_asm_t;
 
