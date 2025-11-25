@@ -1,6 +1,5 @@
 ;==============================================================================
 ; BOCPD Ultra-Optimized AVX2 Kernel - V2 (Interleaved Layout)
-; Windows x64 ABI Version
 ;
 ; ALGORITHM OVERVIEW
 ; ==================
@@ -39,8 +38,8 @@
 ; REGISTER ALLOCATION
 ; ===================
 ; Callee-saved (preserved):
-;   RBX, RBP, RDI, RSI, R12-R15 (Windows x64 ABI)
-;   XMM6-XMM15 (Windows x64 ABI - must save/restore)
+;   r8=lin_interleaved, r12=r_old, r13=r_new, r14=n_padded, rdi=args
+;   rsi=loop_counter, rbx=last_valid
 ;
 ; Dedicated YMM (never spilled):
 ;   ymm8=x, ymm9=h, ymm10=1-h, ymm11=threshold
@@ -49,11 +48,7 @@
 ;
 ; Scratch: ymm0-ymm7 (reused freely each iteration)
 ;
-; Calling convention: Windows x64 ABI
-;   - First argument in RCX (pointer to args struct)
-;   - Must preserve RBX, RBP, RDI, RSI, R12-R15
-;   - Must preserve XMM6-XMM15
-;
+; Calling convention: System V AMD64 ABI
 ; void bocpd_fused_loop_avx2_generic(const bocpd_kernel_args_t *args);
 ;
 ; Input structure (bocpd_kernel_args_t):
@@ -70,6 +65,9 @@
 ;   +80  size_t* max_idx_out      ; Output: index of max growth
 ;   +88  size_t* last_valid_out   ; Output: last index above threshold
 ;==============================================================================
+
+; Mark stack as non-executable (ELF security best practice)
+section .note.GNU-stack noalloc noexec nowrite progbits
 
 section .rodata
 align 32                            ; AVX2 requires 32-byte alignment
@@ -185,46 +183,19 @@ global bocpd_fused_loop_avx2_generic
 
 bocpd_fused_loop_avx2_generic:
     ;==========================================================================
-    ; PROLOGUE: Save callee-saved registers (Windows x64 ABI)
-    ;
-    ; Windows x64 callee-saved registers:
-    ;   - General: RBX, RBP, RDI, RSI, R12-R15
-    ;   - XMM: XMM6-XMM15 (lower 128 bits must be preserved)
-    ;
-    ; First argument comes in RCX on Windows (not RDI like System V)
+    ; PROLOGUE: Save callee-saved registers, set up aligned stack frame
     ;==========================================================================
     
-    ; Save general-purpose callee-saved registers
+    ; System V AMD64: rbx, rbp, r12-r15 are callee-saved
     push        rbp
     push        rbx
-    push        rdi
-    push        rsi
     push        r12
     push        r13
     push        r14
     push        r15
     
-    ; Save non-volatile XMM registers (Windows x64 requires XMM6-15 preserved)
-    ; We use all of these in our kernel, so must save them all
-    ; 10 registers × 16 bytes = 160 bytes, +8 for alignment = 168
-    sub         rsp, 168
-    vmovdqu     [rsp], xmm6
-    vmovdqu     [rsp + 16], xmm7
-    vmovdqu     [rsp + 32], xmm8
-    vmovdqu     [rsp + 48], xmm9
-    vmovdqu     [rsp + 64], xmm10
-    vmovdqu     [rsp + 80], xmm11
-    vmovdqu     [rsp + 96], xmm12
-    vmovdqu     [rsp + 112], xmm13
-    vmovdqu     [rsp + 128], xmm14
-    vmovdqu     [rsp + 144], xmm15
-    
-    ; Windows x64: first argument is in RCX
-    ; We use RDI internally to keep the rest of the code consistent
-    mov         rdi, rcx
-    
     ; Set up aligned stack frame (AVX2 requires 32-byte alignment)
-    mov         rbp, rsp                            ; Save current RSP for epilogue
+    mov         rbp, rsp                            ; Save original RSP for epilogue
     sub         rsp, STACK_SIZE + 32                ; Allocate local storage
     and         rsp, -32                            ; Align to 32 bytes
     
@@ -632,30 +603,13 @@ bocpd_fused_loop_avx2_generic:
     mov         [rax], rbx                          ; *last_valid_out = truncation boundary
     
     ;==========================================================================
-    ; EPILOGUE: Restore callee-saved registers and return (Windows x64 ABI)
+    ; EPILOGUE: Restore callee-saved registers and return
     ;==========================================================================
-    mov         rsp, rbp                            ; Restore stack pointer to after XMM saves
-    
-    ; Restore non-volatile XMM registers (Windows x64 requires XMM6-15 preserved)
-    vmovdqu     xmm6, [rsp]
-    vmovdqu     xmm7, [rsp + 16]
-    vmovdqu     xmm8, [rsp + 32]
-    vmovdqu     xmm9, [rsp + 48]
-    vmovdqu     xmm10, [rsp + 64]
-    vmovdqu     xmm11, [rsp + 80]
-    vmovdqu     xmm12, [rsp + 96]
-    vmovdqu     xmm13, [rsp + 112]
-    vmovdqu     xmm14, [rsp + 128]
-    vmovdqu     xmm15, [rsp + 144]
-    add         rsp, 168                            ; Deallocate XMM save area
-    
-    ; Restore general-purpose callee-saved registers (reverse order of push)
+    mov         rsp, rbp                            ; Restore original stack pointer
     pop         r15
     pop         r14
     pop         r13
     pop         r12
-    pop         rsi
-    pop         rdi
     pop         rbx
     pop         rbp
     
