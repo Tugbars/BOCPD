@@ -137,9 +137,9 @@
  *
  * | Metric                    | Value           |
  * |---------------------------|-----------------|
- * | Throughput (single)       | ~800K obs/sec   |
- * | Throughput (pool, 100)    | ~1.2M obs/sec   |
- * | Per-observation latency   | ~1.2 μs         |
+ * | Throughput (single)       | ~1.2K obs/sec   |
+ * | Throughput (pool, 100)    | ~1.6M obs/sec   |
+ * | Per-observation latency   | ~0.6 μs         |
  * | Memory per detector       | ~52 × capacity × 8 bytes |
  * | Initialization time       | ~50 μs          |
  *
