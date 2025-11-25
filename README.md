@@ -19,9 +19,17 @@ BOCPD maintains a probability distribution over "run lengths" — time since the
 | Method | Latency | Detects | Online |
 |--------|---------|---------|--------|
 | CUSUM | ~100ns | Mean shift | ✓ |
-| **BOCPD** | **~2µs** | **Mean + Variance** | **✓** |
+| **BOCPD** | **~0.7µs** | **Mean + Variance** | **✓** |
 | HMM | ~50µs | Regimes | ✓ |
 | Offline CPD | ~10ms | All | ✗ |
+
+**Benchmark Results (Intel Core i9):**
+
+| Configuration | Latency | Throughput |
+|---------------|---------|------------|
+| Single detector | 0.70 µs | 1.42M obs/sec |
+| Pool (100 instruments) | 0.58 µs | 1.72M obs/sec |
+| Large scale (380 instruments) | 0.87 µs | 1.15M obs/sec |
 
 ---
 
