@@ -1,13 +1,14 @@
 /**
  * @file bocpd_asm.h
- * @brief AVX2 Assembly-Optimized BOCPD Implementation
+ * @brief AVX2 Assembly-Optimized BOCPD Implementation (Ping-Pong Buffering)
  *
  * Ultra-fast Bayesian Online Changepoint Detection with:
  *   - Hand-written AVX2 assembly inner loop
+ *   - Ping-pong double buffering (eliminates memmove)
+ *   - Fused shift + update in single pass
  *   - Single mega-block allocation per detector
  *   - Pool allocator for multiple detectors
  *   - Precomputed prior lgamma values
- *   - Permanent interleaved layout (no copy overhead)
  */
 
 #ifndef BOCPD_ASM_H
@@ -56,7 +57,12 @@ typedef struct bocpd_prior {
 } bocpd_prior_t;
 
 /*=============================================================================
- * Detector State
+ * Detector State (Ping-Pong Double Buffering)
+ *
+ * All posterior arrays are double-buffered [0] and [1].
+ * cur_buf indicates which buffer is current (0 or 1).
+ * Updates read from cur, write to next (1 - cur_buf), then swap.
+ * This eliminates all memmove operations.
  *=============================================================================*/
 
 typedef struct bocpd_asm {
@@ -71,39 +77,33 @@ typedef struct bocpd_asm {
     double prior_lgamma_alpha;
     double prior_lgamma_alpha_p5;
     
-    /*--- Ring buffer state ---*/
-    size_t ring_start;
-    size_t active_len;
+    /*--- Ping-pong buffer state ---*/
+    int cur_buf;              /**< Current buffer index: 0 or 1 */
+    size_t active_len;        /**< Number of active run lengths */
     
-    /*--- Sufficient statistics ---*/
-    double *ss_n;
-    double *ss_sum;
-    double *ss_sum2;
+    /*--- Double-buffered sufficient statistics ---*/
+    double *ss_n[2];
+    double *ss_sum[2];
+    double *ss_sum2[2];
     
-    /*--- Posterior parameters ---*/
-    double *post_kappa;
-    double *post_mu;
-    double *post_alpha;
-    double *post_beta;
+    /*--- Double-buffered posterior parameters ---*/
+    double *post_kappa[2];
+    double *post_mu[2];
+    double *post_alpha[2];
+    double *post_beta[2];
     
-    /*--- Student-t precomputed constants ---*/
-    double *C1;
-    double *C2;
-    double *sigma_sq;
-    double *inv_sigma_sq_nu;
-    double *lgamma_alpha;
-    double *lgamma_alpha_p5;
+    /*--- Double-buffered Student-t precomputed constants ---*/
+    double *C1[2];
+    double *C2[2];
+    double *sigma_sq[2];
+    double *inv_sigma_sq_nu[2];
+    double *lgamma_alpha[2];
+    double *lgamma_alpha_p5[2];
     
-    /*--- Interleaved buffer for SIMD kernel ---*/
+    /*--- Interleaved buffer for SIMD kernel (single, rebuilt each step) ---*/
     double *lin_interleaved;
     
-    /*--- Legacy linear views (unused, kept for compatibility) ---*/
-    double *lin_mu;
-    double *lin_C1;
-    double *lin_C2;
-    double *lin_inv_ssn;
-    
-    /*--- Run-length distribution ---*/
+    /*--- Run-length distribution (single, kernel uses scratch internally) ---*/
     double *r;
     double *r_scratch;
     
@@ -113,11 +113,20 @@ typedef struct bocpd_asm {
     double p_changepoint;
     
     /*--- Memory management ---*/
-    void *block;
     void *mega;
     size_t mega_bytes;
     
 } bocpd_asm_t;
+
+/*=============================================================================
+ * Buffer Access Macros
+ *
+ * CUR(arr)  - Access current buffer for reading
+ * NEXT(arr) - Access next buffer for writing
+ *=============================================================================*/
+
+#define BOCPD_CUR(b, arr)  ((b)->arr[(b)->cur_buf])
+#define BOCPD_NEXT(b, arr) ((b)->arr[1 - (b)->cur_buf])
 
 /*=============================================================================
  * Pool Allocator for Multiple Detectors
@@ -177,34 +186,15 @@ static inline double bocpd_ultra_get_change_prob(const bocpd_asm_t *b) {
  * @param max_run_length Maximum run length to track
  *
  * @return 0 on success, -1 on failure
- *
- * This allocates a single contiguous memory block for all detectors.
- * Initialization time: ~1-2ms for 100 detectors (vs ~300ms with individual allocs)
  */
 int bocpd_pool_init(bocpd_pool_t *pool, size_t n_detectors,
                     double hazard_lambda, bocpd_prior_t prior,
                     size_t max_run_length);
 
-/**
- * @brief Free pool resources.
- *
- * Single free() call for all detectors.
- * Do NOT call bocpd_ultra_free() on pool-managed detectors.
- */
 void bocpd_pool_free(bocpd_pool_t *pool);
 
-/**
- * @brief Reset all detectors in pool to initial state.
- */
 void bocpd_pool_reset(bocpd_pool_t *pool);
 
-/**
- * @brief Get detector by index.
- *
- * @param pool   Pool
- * @param index  Detector index (0 to n_detectors-1)
- * @return Pointer to detector, or NULL if invalid
- */
 bocpd_asm_t* bocpd_pool_get(bocpd_pool_t *pool, size_t index);
 
 /*=============================================================================
