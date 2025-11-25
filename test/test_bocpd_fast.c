@@ -34,15 +34,21 @@ static double get_time_ms(void)
 #endif
 
 /* Simple random normal using Box-Muller */
+static int randn_have_spare = 0;
+static double randn_spare = 0.0;
+
+static void randn_reset(void)
+{
+    randn_have_spare = 0;
+    randn_spare = 0.0;
+}
+
 static double randn(double mu, double sigma)
 {
-    static int have_spare = 0;
-    static double spare;
-
-    if (have_spare)
+    if (randn_have_spare)
     {
-        have_spare = 0;
-        return spare * sigma + mu;
+        randn_have_spare = 0;
+        return randn_spare * sigma + mu;
     }
 
     double u, v, s;
@@ -54,8 +60,8 @@ static double randn(double mu, double sigma)
     } while (s >= 1.0 || s == 0.0);
 
     s = sqrt(-2.0 * log(s) / s);
-    spare = v * s;
-    have_spare = 1;
+    randn_spare = v * s;
+    randn_have_spare = 1;
     return u * s * sigma + mu;
 }
 
@@ -127,25 +133,44 @@ static int test_mean_shift(void)
 static void benchmark_throughput(void)
 {
     printf("\n=== Benchmark: ASM Kernel Throughput ===\n");
+    fflush(stdout);
 
     bocpd_asm_t cpd;
     bocpd_prior_t prior = {0.0, 1.0, 1.0, 1.0};
+    
+    printf("Initializing detector...\n");
+    fflush(stdout);
+    
     bocpd_ultra_init(&cpd, 250.0, prior, 2000);
+
+    printf("Generating data...\n");
+    fflush(stdout);
 
     srand(11111);
 
-    const int n_samples = 100;
+    const int n_samples = 500;
     double *data = malloc(n_samples * sizeof(double));
     for (int i = 0; i < n_samples; i++)
     {
         data[i] = randn(0.0, 1.0);
     }
 
+    printf("Warming up...\n");
+    fflush(stdout);
+
     /* Warm up */
     for (int i = 0; i < 100; i++)
     {
-        bocpd_ultra_step(&cpd, data[i]);
+        bocpd_ultra_step(&cpd, data[i % n_samples]);
+        if (i % 20 == 0) {
+            printf("  warmup step %d, active_len=%zu\n", i, cpd.active_len);
+            fflush(stdout);
+        }
     }
+    
+    printf("Resetting...\n");
+    fflush(stdout);
+    
     bocpd_ultra_reset(&cpd);
 
     /* Timed run */
@@ -169,34 +194,40 @@ static void benchmark_throughput(void)
     bocpd_ultra_free(&cpd);
 }
 
-static void benchmark_multiple_instruments(void)
+static void benchmark_multiple_instruments_old(void)
 {
-    printf("\n=== Benchmark: 380 Instruments (Simulated) ===\n");
+    printf("\n=== Benchmark: Multi-Instrument (Individual Alloc) ===\n");
 
     const int n_instruments = 100;
     const int n_steps = 100;
 
-    printf("Allocating %d detectors...\n", n_instruments);
-    fflush(stdout);
-
-    bocpd_asm_t *cpds = malloc(n_instruments * sizeof(bocpd_asm_t));
     bocpd_prior_t prior = {0.0, 1.0, 1.0, 1.0};
 
+    printf("Allocating %d detectors individually...\n", n_instruments);
+    fflush(stdout);
+
+    double alloc_start = get_time_ms();
+
+    bocpd_asm_t *cpds = malloc(n_instruments * sizeof(bocpd_asm_t));
     for (int i = 0; i < n_instruments; i++)
     {
-        if (i % 100 == 0) {
-            printf("  Init detector %d/%d\n", i, n_instruments);
+        if (i % 20 == 0) {
+            printf("  Alloc detector %d/%d\n", i, n_instruments);
             fflush(stdout);
         }
         bocpd_ultra_init(&cpds[i], 250.0, prior, 500);
     }
 
-    printf("Generating test data...\n");
+    double alloc_end = get_time_ms();
+    printf("Individual allocation time: %.2f ms\n", alloc_end - alloc_start);
     fflush(stdout);
 
+    /* Generate test data */
+    printf("Generating test data...\n");
+    fflush(stdout);
+    
     srand(22222);
-
-    /* Generate data for all instruments */
+    randn_reset();
     double **data = malloc(n_instruments * sizeof(double *));
     for (int i = 0; i < n_instruments; i++)
     {
@@ -207,7 +238,7 @@ static void benchmark_multiple_instruments(void)
         }
     }
 
-    printf("Running benchmark...\n");
+    printf("Running processing benchmark...\n");
     fflush(stdout);
 
     /* Timed run */
@@ -215,7 +246,7 @@ static void benchmark_multiple_instruments(void)
 
     for (int t = 0; t < n_steps; t++)
     {
-        if (t % 50 == 0) {
+        if (t % 20 == 0) {
             printf("  Step %d/%d\n", t, n_steps);
             fflush(stdout);
         }
@@ -227,15 +258,11 @@ static void benchmark_multiple_instruments(void)
 
     double end = get_time_ms();
     double elapsed_ms = end - start;
-    double per_step_ms = elapsed_ms / n_steps;
-    double per_instrument_us = (elapsed_ms * 1000.0) / (n_steps * n_instruments);
 
-    printf("Processed %d instruments x %d steps = %d total updates\n",
-           n_instruments, n_steps, n_instruments * n_steps);
-    printf("Total time: %.2f ms\n", elapsed_ms);
-    printf("Per time step (all 380 instruments): %.2f ms\n", per_step_ms);
-    printf("Per instrument per step: %.2f us\n", per_instrument_us);
-    printf("Throughput: %.0f obs/sec\n", (double)(n_instruments * n_steps) / (elapsed_ms / 1000.0));
+    printf("Processing time: %.2f ms\n", elapsed_ms);
+    printf("Throughput: %.0f obs/sec\n", 
+           (double)(n_instruments * n_steps) / (elapsed_ms / 1000.0));
+    fflush(stdout);
 
     printf("Cleaning up...\n");
     fflush(stdout);
@@ -249,8 +276,178 @@ static void benchmark_multiple_instruments(void)
     free(data);
     free(cpds);
     
-    printf("Done!\n");
+    printf("Done with individual alloc benchmark!\n");
     fflush(stdout);
+}
+
+static void benchmark_multiple_instruments_pool(void)
+{
+    printf("\n=== Benchmark: Multi-Instrument (Pool Allocator) ===\n");
+
+    const int n_instruments = 100;
+    const int n_steps = 100;
+
+    bocpd_prior_t prior = {0.0, 1.0, 1.0, 1.0};
+    bocpd_pool_t pool;
+
+    printf("Allocating %d detectors via pool...\n", n_instruments);
+    fflush(stdout);
+
+    double alloc_start = get_time_ms();
+
+    if (bocpd_pool_init(&pool, n_instruments, 250.0, prior, 500) != 0)
+    {
+        printf("FAIL: Could not initialize pool\n");
+        return;
+    }
+
+    double alloc_end = get_time_ms();
+    printf("Pool allocation time: %.2f ms\n", alloc_end - alloc_start);
+    printf("Pool size: %.2f KB\n", pool.pool_size / 1024.0);
+
+    /* Generate test data */
+    srand(22222);
+    randn_reset();
+    double **data = malloc(n_instruments * sizeof(double *));
+    for (int i = 0; i < n_instruments; i++)
+    {
+        data[i] = malloc(n_steps * sizeof(double));
+        for (int t = 0; t < n_steps; t++)
+        {
+            data[i][t] = randn(0.0, 1.0);
+        }
+    }
+
+    /* Timed run */
+    double start = get_time_ms();
+
+    for (int t = 0; t < n_steps; t++)
+    {
+        for (int i = 0; i < n_instruments; i++)
+        {
+            bocpd_asm_t *det = bocpd_pool_get(&pool, i);
+            bocpd_ultra_step(det, data[i][t]);
+        }
+    }
+
+    double end = get_time_ms();
+    double elapsed_ms = end - start;
+    double per_step_ms = elapsed_ms / n_steps;
+    double per_instrument_us = (elapsed_ms * 1000.0) / (n_steps * n_instruments);
+
+    printf("Processed %d instruments x %d steps = %d total updates\n",
+           n_instruments, n_steps, n_instruments * n_steps);
+    printf("Processing time: %.2f ms\n", elapsed_ms);
+    printf("Per time step (all instruments): %.2f ms\n", per_step_ms);
+    printf("Per instrument per step: %.2f us\n", per_instrument_us);
+    printf("Throughput: %.0f obs/sec\n", 
+           (double)(n_instruments * n_steps) / (elapsed_ms / 1000.0));
+
+    /* Cleanup */
+    for (int i = 0; i < n_instruments; i++)
+    {
+        free(data[i]);
+    }
+    free(data);
+    
+    bocpd_pool_free(&pool);
+    
+    printf("Done!\n");
+}
+
+static void benchmark_large_scale(void)
+{
+    printf("\n=== Benchmark: Large Scale (380 Instruments x 500 Steps) ===\n");
+
+    const int n_instruments = 380;
+    const int n_steps = 500;
+
+    bocpd_prior_t prior = {0.0, 1.0, 1.0, 1.0};
+    bocpd_pool_t pool;
+
+    printf("Allocating %d detectors via pool...\n", n_instruments);
+    fflush(stdout);
+
+    double alloc_start = get_time_ms();
+
+    if (bocpd_pool_init(&pool, n_instruments, 250.0, prior, 500) != 0)
+    {
+        printf("FAIL: Could not initialize pool\n");
+        return;
+    }
+
+    double alloc_end = get_time_ms();
+    printf("Pool allocation time: %.2f ms\n", alloc_end - alloc_start);
+    printf("Pool size: %.2f MB\n", pool.pool_size / (1024.0 * 1024.0));
+
+    /* Generate test data */
+    printf("Generating test data...\n");
+    srand(33333);
+    randn_reset();
+    double **data = malloc(n_instruments * sizeof(double *));
+    for (int i = 0; i < n_instruments; i++)
+    {
+        data[i] = malloc(n_steps * sizeof(double));
+        for (int t = 0; t < n_steps; t++)
+        {
+            /* Add a changepoint at t=250 for some instruments */
+            if (i % 10 == 0 && t >= 250)
+                data[i][t] = randn(3.0, 1.0);
+            else
+                data[i][t] = randn(0.0, 1.0);
+        }
+    }
+
+    printf("Running benchmark...\n");
+    fflush(stdout);
+
+    /* Timed run */
+    double start = get_time_ms();
+
+    for (int t = 0; t < n_steps; t++)
+    {
+        for (int i = 0; i < n_instruments; i++)
+        {
+            bocpd_asm_t *det = bocpd_pool_get(&pool, i);
+            bocpd_ultra_step(det, data[i][t]);
+        }
+    }
+
+    double end = get_time_ms();
+    double elapsed_ms = end - start;
+    double per_step_ms = elapsed_ms / n_steps;
+    double per_instrument_us = (elapsed_ms * 1000.0) / (n_steps * n_instruments);
+    long total_updates = (long)n_instruments * n_steps;
+
+    printf("\nResults:\n");
+    printf("  Total updates: %ld\n", total_updates);
+    printf("  Total time: %.2f ms\n", elapsed_ms);
+    printf("  Per time step (all %d instruments): %.2f ms\n", n_instruments, per_step_ms);
+    printf("  Per instrument per step: %.2f us\n", per_instrument_us);
+    printf("  Throughput: %.0f obs/sec\n", 
+           (double)total_updates / (elapsed_ms / 1000.0));
+
+    /* Check for changepoint detections */
+    int changes_detected = 0;
+    for (int i = 0; i < n_instruments; i += 10)
+    {
+        bocpd_asm_t *det = bocpd_pool_get(&pool, i);
+        if (det->map_runlength < 200)
+            changes_detected++;
+    }
+    printf("  Changepoints detected: %d / %d instruments with shifts\n", 
+           changes_detected, n_instruments / 10);
+
+    /* Cleanup */
+    for (int i = 0; i < n_instruments; i++)
+    {
+        free(data[i]);
+    }
+    free(data);
+    
+    bocpd_pool_free(&pool);
+    
+    printf("Done!\n");
 }
 
 int main(void)
@@ -266,10 +463,18 @@ int main(void)
 
     int failures = 0;
 
+    /* Correctness test */
     failures += (test_mean_shift() != 0);
 
+    /* Single detector throughput */
     benchmark_throughput();
-    benchmark_multiple_instruments();
+
+    /* Compare individual vs pool allocation */
+    benchmark_multiple_instruments_old();
+    benchmark_multiple_instruments_pool();
+
+    /* Large scale benchmark */
+    benchmark_large_scale();
 
     printf("\n=== Summary ===\n");
     if (failures == 0)
