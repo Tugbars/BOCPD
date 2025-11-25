@@ -48,25 +48,31 @@
  *    - Each block = 128 bytes = 2 cache lines (perfect spatial locality)
  *    - Single cache miss loads all parameters for 4 run lengths
  *
- * 3. **Vectorized Posterior Updates**
+ * 3. **Hand-Written AVX2 Assembly Kernel**
+ *    - Processes 8 elements per iteration (2 blocks of 4)
+ *    - Estrin's polynomial scheme for reduced dependency depth
+ *    - IEEE-754 direct exponent manipulation for 2^k
+ *    - Running index vectors instead of per-iteration broadcasts
+ *
+ * 4. **Vectorized Posterior Updates**
  *    - AVX2 SIMD for Welford update (4 posteriors per iteration)
  *    - Reduces O(n) scalar loop to O(n/4) vector loop
  *
- * 4. **Fast Polynomial Approximations**
+ * 5. **Fast Polynomial Approximations**
  *    - log1p(t): 6th-order Taylor series (avoids libm)
  *    - exp(x): Range reduction + Estrin polynomial + IEEE-754 bit manipulation
  *    - ~10x faster than glibc exp/log
  *
- * 5. **Fused Truncation Tracking**
+ * 6. **Fused Truncation Tracking**
  *    - Tracks last significant probability during main loop
  *    - No second pass needed for truncation decision
  *
- * 6. **Pool Allocator**
+ * 7. **Pool Allocator**
  *    - Single malloc for multiple detectors
  *    - ~10x faster initialization for multi-instrument scenarios
  *    - Zero heap fragmentation
  *
- * 7. **Precomputed Constants**
+ * 8. **Precomputed Constants**
  *    - lgamma(α₀) and lgamma(α₀+0.5) computed once at init
  *    - Copied to new slots instead of recomputing
  *
@@ -94,6 +100,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <immintrin.h>
+
+/*=============================================================================
+ * Configuration: Use Assembly Kernel vs C Intrinsics
+ *
+ * Set BOCPD_USE_ASM_KERNEL=1 to use the hand-written assembly kernel.
+ * Set BOCPD_USE_ASM_KERNEL=0 to use C intrinsics (portable fallback).
+ *=============================================================================*/
+#ifndef BOCPD_USE_ASM_KERNEL
+#define BOCPD_USE_ASM_KERNEL 1
+#endif
 
 /*=============================================================================
  * Fast Scalar Logarithm
@@ -422,22 +438,147 @@ static void update_posteriors_simd(bocpd_asm_t *b, double x, size_t n)
 }
 
 /*=============================================================================
- * Fused SIMD Prediction Kernel
+ * Fused SIMD Prediction Kernel (Assembly Version)
  *
- * Computes predictive probabilities and updates run-length distribution.
- * Processes 8 elements per iteration (2 blocks of 4) for maximum throughput.
+ * Calls the hand-written AVX2 assembly kernel for maximum performance.
+ * The assembly kernel handles:
+ *   - Predictive probability computation (Student-t)
+ *   - Run-length distribution update (growth + changepoint)
+ *   - MAP tracking (maximum probability run length)
+ *   - Truncation tracking (last significant probability)
  *
- * For each run length i:
- *   1. Load parameters from interleaved buffer
- *   2. Compute Student-t: pp = exp(C1 - C2·log1p((x-μ)²/(σ²ν)))
- *   3. Growth: r_new[i+1] = r[i] · pp · (1-h)
- *   4. Change: r_new[0] += r[i] · pp · h
- *   5. Track maximum for MAP estimate
- *   6. Track last significant value for truncation
+ * After the kernel returns, this function:
+ *   - Normalizes the distribution
+ *   - Updates active_len based on truncation
+ *   - Sets map_runlength
+ *=============================================================================*/
+
+#if BOCPD_USE_ASM_KERNEL
+
+static void fused_step_simd(bocpd_asm_t *b, double x)
+{
+    const size_t n = b->active_len;
+    if (n == 0)
+        return;
+
+    const double thresh = b->trunc_thresh;
+
+    /* Build interleaved buffer for SIMD access */
+    build_interleaved(b);
+
+    double *r = b->r;
+    double *r_new = b->r_scratch;
+
+    const size_t n_padded = (n + 7) & ~7ULL;
+
+    /* Zero-pad input beyond active length */
+    for (size_t i = n; i < n_padded + 8; i++)
+        r[i] = 0.0;
+
+    /* Zero output buffer */
+    memset(r_new, 0, (n_padded + 16) * sizeof(double));
+
+    /*-------------------------------------------------------------------------
+     * Prepare kernel arguments
+     *-------------------------------------------------------------------------*/
+    double r0_out = 0.0;
+    double max_growth_out = 0.0;
+    size_t max_idx_out = 0;
+    size_t last_valid_out = 0;
+
+    bocpd_kernel_args_t args = {
+        .lin_interleaved = b->lin_interleaved,
+        .r_old = r,
+        .x = x,
+        .h = b->hazard,
+        .one_minus_h = b->one_minus_h,
+        .trunc_thresh = thresh,
+        .n_padded = n_padded,
+        .r_new = r_new,
+        .r0_out = &r0_out,
+        .max_growth_out = &max_growth_out,
+        .max_idx_out = &max_idx_out,
+        .last_valid_out = &last_valid_out
+    };
+
+    /*-------------------------------------------------------------------------
+     * Call assembly kernel
+     *-------------------------------------------------------------------------*/
+    bocpd_fused_loop_avx2(&args);
+
+    /*-------------------------------------------------------------------------
+     * Post-process kernel outputs
+     *-------------------------------------------------------------------------*/
+
+    /* CRITICAL: The assembly kernel writes r0 to *r0_out, NOT to r_new[0].
+     * We must set r_new[0] here before normalization. */
+    r_new[0] = r0_out;
+
+    /* Check if r0 itself is above threshold */
+    if (r0_out > thresh && last_valid_out == 0)
+        last_valid_out = 1;
+
+    /* Determine new active length based on truncation */
+    size_t new_len = (last_valid_out > 0) ? last_valid_out + 1 : n + 1;
+    if (new_len > b->capacity)
+        new_len = b->capacity;
+
+    size_t new_len_padded = (new_len + 7) & ~7ULL;
+
+    /*-------------------------------------------------------------------------
+     * Normalize distribution
+     *-------------------------------------------------------------------------*/
+    __m256d sum_acc = _mm256_setzero_pd();
+    for (size_t i = 0; i < new_len_padded; i += 4)
+        sum_acc = _mm256_add_pd(sum_acc, _mm256_loadu_pd(&r_new[i]));
+
+    /* Horizontal sum */
+    __m128d lo = _mm256_castpd256_pd128(sum_acc);
+    __m128d hi = _mm256_extractf128_pd(sum_acc, 1);
+    lo = _mm_add_pd(lo, hi);
+    lo = _mm_add_pd(lo, _mm_shuffle_pd(lo, lo, 1));
+    double r_sum = _mm_cvtsd_f64(lo);
+
+    /* Normalize: r[i] = r_new[i] / sum */
+    if (r_sum > 1e-300)
+    {
+        __m256d inv_sum = _mm256_set1_pd(1.0 / r_sum);
+        for (size_t i = 0; i < new_len_padded; i += 4)
+        {
+            __m256d rv = _mm256_loadu_pd(&r_new[i]);
+            _mm256_storeu_pd(&r[i], _mm256_mul_pd(rv, inv_sum));
+        }
+    }
+
+    b->active_len = new_len;
+
+    /*-------------------------------------------------------------------------
+     * Determine MAP run length
+     *
+     * The kernel tracked max_growth (which is growth[i] = r_new[i+1]).
+     * We need to compare with r0 to find the true MAP.
+     * max_idx_out from kernel is the index into r_new (1-based for growth).
+     *-------------------------------------------------------------------------*/
+    double r0_normalized = (r_sum > 1e-300) ? r0_out / r_sum : 0.0;
+    double max_normalized = (r_sum > 1e-300) ? max_growth_out / r_sum : 0.0;
+
+    if (r0_normalized >= max_normalized)
+    {
+        b->map_runlength = 0;
+    }
+    else
+    {
+        b->map_runlength = max_idx_out;
+    }
+}
+
+#else /* !BOCPD_USE_ASM_KERNEL - C intrinsics fallback */
+
+/*=============================================================================
+ * Fused SIMD Prediction Kernel (C Intrinsics Version)
  *
- * Fast Math Approximations:
- *   - log1p: 6th-order Taylor series
- *   - exp: Range reduction to [-0.5, 0.5], Estrin polynomial, IEEE-754 2^k
+ * Portable fallback using C intrinsics instead of assembly.
+ * Same algorithm as the assembly version but ~10-20% slower.
  *=============================================================================*/
 
 static void fused_step_simd(bocpd_asm_t *b, double x)
@@ -480,23 +621,20 @@ static void fused_step_simd(bocpd_asm_t *b, double x)
     const __m256d const_one = _mm256_set1_pd(1.0);
 
     /* Accumulators */
-    __m256d r0_acc_a = _mm256_setzero_pd();     /* Changepoint probability sum (block A) */
-    __m256d r0_acc_b = _mm256_setzero_pd();     /* Changepoint probability sum (block B) */
-    __m256d max_growth_a = _mm256_setzero_pd(); /* Maximum for MAP (block A) */
-    __m256d max_growth_b = _mm256_setzero_pd(); /* Maximum for MAP (block B) */
+    __m256d r0_acc_a = _mm256_setzero_pd();
+    __m256d r0_acc_b = _mm256_setzero_pd();
+    __m256d max_growth_a = _mm256_setzero_pd();
+    __m256d max_growth_b = _mm256_setzero_pd();
     __m256i max_idx_a = _mm256_setzero_si256();
     __m256i max_idx_b = _mm256_setzero_si256();
 
-    /* Running index vectors (incremented each iteration) */
     __m256i idx_vec_a = _mm256_set_epi64x(4, 3, 2, 1);
     __m256i idx_vec_b = _mm256_set_epi64x(8, 7, 6, 5);
     const __m256i idx_inc = _mm256_set1_epi64x(8);
 
-    size_t last_valid = 0; /* Truncation boundary */
+    size_t last_valid = 0;
 
-    /*-------------------------------------------------------------------------
-     * Polynomial Coefficients for log1p and exp
-     *-------------------------------------------------------------------------*/
+    /* Polynomial coefficients */
     const __m256d log1p_c2 = _mm256_set1_pd(-0.5);
     const __m256d log1p_c3 = _mm256_set1_pd(0.3333333333333333);
     const __m256d log1p_c4 = _mm256_set1_pd(-0.25);
@@ -515,29 +653,24 @@ static void fused_step_simd(bocpd_asm_t *b, double x)
     const __m256i exp_bias = _mm256_set1_epi64x(1023);
 
     /*=========================================================================
-     * Main Loop: Process 8 elements per iteration (Block A + Block B)
+     * Main Loop: Process 8 elements per iteration
      *=========================================================================*/
     for (size_t i = 0; i < n_padded; i += 8)
     {
-        /*---------------------------------------------------------------------
-         * BLOCK A: Elements [i, i+1, i+2, i+3]
-         *---------------------------------------------------------------------*/
+        /* BLOCK A */
         size_t block_a = i / 4;
         double *base_a = &b->lin_interleaved[block_a * 16];
 
-        /* Load interleaved parameters */
         __m256d mu_a = _mm256_loadu_pd(base_a + 0);
         __m256d C1_a = _mm256_loadu_pd(base_a + 4);
         __m256d C2_a = _mm256_loadu_pd(base_a + 8);
         __m256d inv_ssn_a = _mm256_loadu_pd(base_a + 12);
         __m256d r_old_a = _mm256_loadu_pd(&r[i]);
 
-        /* Compute t = (x - μ)² / (σ²ν) */
         __m256d z_a = _mm256_sub_pd(x_vec, mu_a);
         __m256d z2_a = _mm256_mul_pd(z_a, z_a);
         __m256d t_a = _mm256_mul_pd(z2_a, inv_ssn_a);
 
-        /* log1p(t) via Horner's method */
         __m256d poly_a = _mm256_fmadd_pd(t_a, log1p_c6, log1p_c5);
         poly_a = _mm256_fmadd_pd(t_a, poly_a, log1p_c4);
         poly_a = _mm256_fmadd_pd(t_a, poly_a, log1p_c3);
@@ -545,16 +678,13 @@ static void fused_step_simd(bocpd_asm_t *b, double x)
         poly_a = _mm256_fmadd_pd(t_a, poly_a, const_one);
         __m256d log1p_t_a = _mm256_mul_pd(t_a, poly_a);
 
-        /* ln(pp) = C1 - C2·log1p(t) */
         __m256d ln_pp_a = _mm256_fnmadd_pd(C2_a, log1p_t_a, C1_a);
 
-        /* exp(ln_pp): clamp, range reduce, polynomial, scale */
         __m256d x_clamp_a = _mm256_max_pd(_mm256_min_pd(ln_pp_a, exp_max_x), exp_min_x);
         __m256d t_exp_a = _mm256_mul_pd(x_clamp_a, exp_inv_ln2);
         __m256d k_a = _mm256_round_pd(t_exp_a, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
         __m256d f_a = _mm256_sub_pd(t_exp_a, k_a);
 
-        /* Estrin's scheme for 2^f polynomial */
         __m256d f2_a = _mm256_mul_pd(f_a, f_a);
         __m256d p01_a = _mm256_fmadd_pd(f_a, exp_c1, const_one);
         __m256d p23_a = _mm256_fmadd_pd(f_a, exp_c3, exp_c2);
@@ -564,18 +694,15 @@ static void fused_step_simd(bocpd_asm_t *b, double x)
         __m256d f4_a = _mm256_mul_pd(f2_a, f2_a);
         __m256d exp_p_a = _mm256_fmadd_pd(f4_a, q456_a, q0123_a);
 
-        /* 2^k via IEEE-754 bit manipulation */
         __m128i k32_a = _mm256_cvtpd_epi32(k_a);
         __m256i k64_a = _mm256_cvtepi32_epi64(k32_a);
         __m256i biased_a = _mm256_add_epi64(k64_a, exp_bias);
         __m256i bits_a = _mm256_slli_epi64(biased_a, 52);
         __m256d scale_a = _mm256_castsi256_pd(bits_a);
 
-        /* pp = 2^f · 2^k, floored at 1e-300 */
         __m256d pp_a = _mm256_mul_pd(exp_p_a, scale_a);
         pp_a = _mm256_max_pd(pp_a, min_pp);
 
-        /* BOCPD update */
         __m256d r_pp_a = _mm256_mul_pd(r_old_a, pp_a);
         __m256d growth_a = _mm256_mul_pd(r_pp_a, omh_vec);
         __m256d change_a = _mm256_mul_pd(r_pp_a, h_vec);
@@ -583,32 +710,23 @@ static void fused_step_simd(bocpd_asm_t *b, double x)
         _mm256_storeu_pd(&r_new[i + 1], growth_a);
         r0_acc_a = _mm256_add_pd(r0_acc_a, change_a);
 
-        /* MAP tracking: find maximum growth and its index */
         __m256d cmp_a = _mm256_cmp_pd(growth_a, max_growth_a, _CMP_GT_OQ);
         max_growth_a = _mm256_blendv_pd(max_growth_a, growth_a, cmp_a);
         max_idx_a = _mm256_castpd_si256(_mm256_blendv_pd(
             _mm256_castsi256_pd(max_idx_a),
             _mm256_castsi256_pd(idx_vec_a), cmp_a));
 
-        /* Truncation tracking: find last index above threshold */
         __m256d thresh_cmp_a = _mm256_cmp_pd(growth_a, thresh_vec, _CMP_GT_OQ);
         int mask_a = _mm256_movemask_pd(thresh_cmp_a);
         if (mask_a)
         {
-            if (mask_a & 8)
-                last_valid = i + 4;
-            else if (mask_a & 4)
-                last_valid = i + 3;
-            else if (mask_a & 2)
-                last_valid = i + 2;
-            else if (mask_a & 1)
-                last_valid = i + 1;
+            if (mask_a & 8) last_valid = i + 4;
+            else if (mask_a & 4) last_valid = i + 3;
+            else if (mask_a & 2) last_valid = i + 2;
+            else if (mask_a & 1) last_valid = i + 1;
         }
 
-        /*---------------------------------------------------------------------
-         * BLOCK B: Elements [i+4, i+5, i+6, i+7]
-         * (Same algorithm, separate accumulators to avoid dependencies)
-         *---------------------------------------------------------------------*/
+        /* BLOCK B */
         size_t block_b = (i / 4) + 1;
         double *base_b = &b->lin_interleaved[block_b * 16];
 
@@ -670,26 +788,17 @@ static void fused_step_simd(bocpd_asm_t *b, double x)
         int mask_b = _mm256_movemask_pd(thresh_cmp_b);
         if (mask_b)
         {
-            if (mask_b & 8)
-                last_valid = i + 8;
-            else if (mask_b & 4)
-                last_valid = i + 7;
-            else if (mask_b & 2)
-                last_valid = i + 6;
-            else if (mask_b & 1)
-                last_valid = i + 5;
+            if (mask_b & 8) last_valid = i + 8;
+            else if (mask_b & 4) last_valid = i + 7;
+            else if (mask_b & 2) last_valid = i + 6;
+            else if (mask_b & 1) last_valid = i + 5;
         }
 
-        /* Increment index vectors for next iteration */
         idx_vec_a = _mm256_add_epi64(idx_vec_a, idx_inc);
         idx_vec_b = _mm256_add_epi64(idx_vec_b, idx_inc);
     }
 
-    /*=========================================================================
-     * Horizontal Reductions
-     *=========================================================================*/
-
-    /* Sum r0 accumulator: [a,b,c,d] + [e,f,g,h] → scalar sum */
+    /* Horizontal reductions */
     __m256d r0_combined = _mm256_add_pd(r0_acc_a, r0_acc_b);
     __m128d lo = _mm256_castpd256_pd128(r0_combined);
     __m128d hi = _mm256_extractf128_pd(r0_combined, 1);
@@ -702,7 +811,6 @@ static void fused_step_simd(bocpd_asm_t *b, double x)
     if (r0 > thresh && last_valid == 0)
         last_valid = 1;
 
-    /* Find global maximum across all 8 lanes */
     double max_arr_a[4], max_arr_b[4];
     int64_t idx_arr_a[4], idx_arr_b[4];
     _mm256_storeu_pd(max_arr_a, max_growth_a);
@@ -727,16 +835,13 @@ static void fused_step_simd(bocpd_asm_t *b, double x)
         }
     }
 
-    /*=========================================================================
-     * Truncation and Normalization
-     *=========================================================================*/
+    /* Truncation and normalization */
     size_t new_len = (last_valid > 0) ? last_valid + 1 : n + 1;
     if (new_len > b->capacity)
         new_len = b->capacity;
 
     size_t new_len_padded = (new_len + 7) & ~7ULL;
 
-    /* Compute sum for normalization */
     __m256d sum_acc = _mm256_setzero_pd();
     for (size_t i = 0; i < new_len_padded; i += 4)
         sum_acc = _mm256_add_pd(sum_acc, _mm256_loadu_pd(&r_new[i]));
@@ -747,7 +852,6 @@ static void fused_step_simd(bocpd_asm_t *b, double x)
     lo = _mm_add_pd(lo, _mm_shuffle_pd(lo, lo, 1));
     double r_sum = _mm_cvtsd_f64(lo);
 
-    /* Normalize: r[i] = r_new[i] / sum */
     if (r_sum > 1e-300)
     {
         __m256d inv_sum = _mm256_set1_pd(1.0 / r_sum);
@@ -761,6 +865,8 @@ static void fused_step_simd(bocpd_asm_t *b, double x)
     b->active_len = new_len;
     b->map_runlength = map_idx;
 }
+
+#endif /* BOCPD_USE_ASM_KERNEL */
 
 /*=============================================================================
  * Public API: Initialization
