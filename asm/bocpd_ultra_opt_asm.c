@@ -564,7 +564,7 @@ static void fused_step_simd(bocpd_asm_t *b, double x)
             .max_idx_out = &max_idx_result,
             .last_valid_out = &last_valid_result};
 
-        bocpd_fused_loop_avx2(&args);
+        bocpd_fused_loop_avx2_generic(&args);
 
         /* Extract results from assembly kernel */
         double r0 = r0_result;
