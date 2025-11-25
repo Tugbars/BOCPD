@@ -535,7 +535,7 @@ static void fused_step_simd(bocpd_asm_t *b, double x)
         }
     }
 
-#if BOCPD_USE_ASM
+#if BOCPD_USE_ASM 
     /*=========================================================================
      * Assembly kernel path (V2 - Interleaved Layout)
      *

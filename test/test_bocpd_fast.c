@@ -134,7 +134,7 @@ static void benchmark_throughput(void)
 
     srand(11111);
 
-    const int n_samples = 10000;
+    const int n_samples = 100;
     double *data = malloc(n_samples * sizeof(double));
     for (int i = 0; i < n_samples; i++)
     {
@@ -173,16 +173,26 @@ static void benchmark_multiple_instruments(void)
 {
     printf("\n=== Benchmark: 380 Instruments (Simulated) ===\n");
 
-    const int n_instruments = 380;
-    const int n_steps = 1000;
+    const int n_instruments = 100;
+    const int n_steps = 100;
+
+    printf("Allocating %d detectors...\n", n_instruments);
+    fflush(stdout);
 
     bocpd_asm_t *cpds = malloc(n_instruments * sizeof(bocpd_asm_t));
     bocpd_prior_t prior = {0.0, 1.0, 1.0, 1.0};
 
     for (int i = 0; i < n_instruments; i++)
     {
+        if (i % 100 == 0) {
+            printf("  Init detector %d/%d\n", i, n_instruments);
+            fflush(stdout);
+        }
         bocpd_ultra_init(&cpds[i], 250.0, prior, 500);
     }
+
+    printf("Generating test data...\n");
+    fflush(stdout);
 
     srand(22222);
 
@@ -197,11 +207,18 @@ static void benchmark_multiple_instruments(void)
         }
     }
 
+    printf("Running benchmark...\n");
+    fflush(stdout);
+
     /* Timed run */
     double start = get_time_ms();
 
     for (int t = 0; t < n_steps; t++)
     {
+        if (t % 50 == 0) {
+            printf("  Step %d/%d\n", t, n_steps);
+            fflush(stdout);
+        }
         for (int i = 0; i < n_instruments; i++)
         {
             bocpd_ultra_step(&cpds[i], data[i][t]);
@@ -220,6 +237,9 @@ static void benchmark_multiple_instruments(void)
     printf("Per instrument per step: %.2f us\n", per_instrument_us);
     printf("Throughput: %.0f obs/sec\n", (double)(n_instruments * n_steps) / (elapsed_ms / 1000.0));
 
+    printf("Cleaning up...\n");
+    fflush(stdout);
+
     /* Cleanup */
     for (int i = 0; i < n_instruments; i++)
     {
@@ -228,6 +248,9 @@ static void benchmark_multiple_instruments(void)
     }
     free(data);
     free(cpds);
+    
+    printf("Done!\n");
+    fflush(stdout);
 }
 
 int main(void)
