@@ -129,7 +129,7 @@ static inline void iblk_set(double *buf, size_t idx, size_t field_offset, double
  *
  * Uses the identity: x = 2^e × m where m ∈ [1, 2)
  * Then: ln(x) = e·ln(2) + ln(m)
- * 
+ *
  * The mantissa logarithm is computed via arctanh series.
  */
 static inline double fast_log_scalar(double x)
@@ -345,11 +345,11 @@ static inline __m256d fast_lgamma_avx2(__m256d x)
  * Total: ~6 cycles vs ~16 cycles for 4 scalar stores with address calculation
  */
 static inline void store_shifted_field(double *buf, size_t block_idx,
-                                        size_t field_offset, __m256d vals)
+                                       size_t field_offset, __m256d vals)
 {
     /*
      * Rotate right by 1: [v0,v1,v2,v3] → [v3,v0,v1,v2]
-     * 
+     *
      * vpermpd immediate encoding:
      *   imm8[1:0] selects source for dst[0]
      *   imm8[3:2] selects source for dst[1]
@@ -604,11 +604,6 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
 
 /** @} */ /* End of init_update group */
 
-
-
-
-
-
 /*=============================================================================
  * @defgroup prediction Prediction Step
  * @brief Compute predictive probabilities and update run-length distribution
@@ -636,18 +631,18 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
  * 5. Normalize r_new to sum to 1
  */
 
-
 #if BOCPD_USE_ASM_KERNEL
 
 static void prediction_step(bocpd_asm_t *b, double x)
 {
     const size_t n = b->active_len;
-    if (n == 0) return;
+    if (n == 0)
+        return;
 
     const double thresh = b->trunc_thresh;
 
     /* V3: No build_interleaved() needed - data already in native format! */
-    double *params = BOCPD_CUR_BUF(b);  /* Read directly from interleaved buffer */
+    double *params = BOCPD_CUR_BUF(b); /* Read directly from interleaved buffer */
 
     double *r = b->r;
     double *r_new = b->r_scratch;
@@ -669,7 +664,7 @@ static void prediction_step(bocpd_asm_t *b, double x)
 
     /* Package arguments for assembly kernel */
     bocpd_kernel_args_t args = {
-        .lin_interleaved = params,  /* V3: direct pointer, no transformation */
+        .lin_interleaved = params, /* V3: direct pointer, no transformation */
         .r_old = r,
         .x = x,
         .h = b->hazard,
@@ -680,8 +675,7 @@ static void prediction_step(bocpd_asm_t *b, double x)
         .r0_out = &r0_out,
         .max_growth_out = &max_growth_out,
         .max_idx_out = &max_idx_out,
-        .last_valid_out = &last_valid_out
-    };
+        .last_valid_out = &last_valid_out};
 
     /* Call assembly kernel */
     bocpd_fused_loop_avx2(&args);
@@ -710,9 +704,11 @@ static void prediction_step(bocpd_asm_t *b, double x)
     lo = _mm_add_pd(lo, _mm_shuffle_pd(lo, lo, 1));
     double r_sum = _mm_cvtsd_f64(lo);
 
-    if (r_sum > 1e-300) {
+    if (r_sum > 1e-300)
+    {
         __m256d inv_sum = _mm256_set1_pd(1.0 / r_sum);
-        for (size_t i = 0; i < new_len_padded; i += 4) {
+        for (size_t i = 0; i < new_len_padded; i += 4)
+        {
             __m256d rv = _mm256_loadu_pd(&r_new[i]);
             _mm256_storeu_pd(&r[i], _mm256_mul_pd(rv, inv_sum));
         }
@@ -1031,18 +1027,19 @@ void bocpd_ultra_free(bocpd_asm_t *b)
 
 void bocpd_ultra_reset(bocpd_asm_t *b)
 {
-    if (!b) return;
-    
+    if (!b)
+        return;
+
     /* Clear run-length distribution */
     memset(b->r, 0, (b->capacity + 32) * sizeof(double));
     memset(b->r_scratch, 0, (b->capacity + 32) * sizeof(double));
-    
+
     /* Clear interleaved buffers */
     size_t n_blocks = b->capacity / 4 + 2;
     size_t bytes_interleaved = n_blocks * BOCPD_IBLK_STRIDE;
     memset(b->interleaved[0], 0, bytes_interleaved);
     memset(b->interleaved[1], 0, bytes_interleaved);
-    
+
     b->t = 0;
     b->active_len = 0;
     b->cur_buf = 0;
