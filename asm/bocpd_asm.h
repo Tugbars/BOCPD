@@ -21,6 +21,30 @@ extern "C" {
 #define aligned_free(ptr) free(ptr)
 #endif
 
+/*=============================================================================
+ * V3 INTERLEAVED BLOCK LAYOUT CONSTANTS
+ *
+ * Each 256-byte superblock contains 8 fields × 4 elements × 8 bytes:
+ *
+ *   Offset   Field        Purpose
+ *   ------   -----        -------
+ *   0        μ            Posterior mean (prediction)
+ *   32       C1           Student-t log normalization (prediction)
+ *   64       C2           Student-t exponent = α + 0.5 (prediction)
+ *   96       inv_ssn      Precomputed 1/(σ²ν) (prediction)
+ *   128      κ            Pseudo-count (update)
+ *   160      α            Shape parameter (update)
+ *   192      β            Rate parameter (update)
+ *   224      ss_n         Sample count ν = 2α (update)
+ *
+ * The ASM kernel only reads the first 4 fields (128 bytes) for prediction.
+ * The C code uses all 8 fields for posterior updates.
+ *============================================================================*/
+
+#define BOCPD_IBLK_BYTES     256    /* Total bytes per superblock */
+#define BOCPD_IBLK_DOUBLES   32     /* Total doubles per superblock: 256/8 */
+#define BOCPD_IBLK_ELEMS     4      /* Elements per field per block */
+
 /* Interleaved block layout constants */
 #define BOCPD_IBLK_MU       0
 #define BOCPD_IBLK_C1       32

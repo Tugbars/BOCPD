@@ -1,6 +1,26 @@
 ;==============================================================================
-; BOCPD Ultra-Optimized AVX2 Kernel - V2 (Interleaved Layout)
+; BOCPD Ultra-Optimized AVX2 Kernel - V3 (Native Interleaved Layout)
 ; Windows x64 ABI Version
+;
+; V3 CHANGES FROM V2:
+; ===================
+; 1. Block stride changed from 128 to 256 bytes
+;    - V2: 4 fields × 4 elements × 8 bytes = 128 bytes per block
+;    - V3: 8 fields × 4 elements × 8 bytes = 256 bytes per block
+;
+; 2. Only first 4 fields (128 bytes) are used by kernel
+;    - Offset 0:   μ (prediction: posterior mean)
+;    - Offset 32:  C1 (prediction: Student-t constant)
+;    - Offset 64:  C2 (prediction: Student-t exponent)
+;    - Offset 96:  inv_ssn (prediction: 1/(σ²ν))
+;    - Offsets 128-255: κ, α, β, ss_n (used by C update code only)
+;
+; 3. Address calculation change:
+;    - V2: byte_offset = (i/4) * 128 = i * 32
+;    - V3: byte_offset = (i/4) * 256 = i * 64
+;
+; The kernel reads the same 4 fields at the same relative offsets within
+; each block, just with a larger stride between blocks.
 ;
 ; ALGORITHM OVERVIEW
 ; ==================
@@ -18,10 +38,9 @@
 ;
 ; KEY OPTIMIZATIONS
 ; =================
-; 1. INTERLEAVED MEMORY LAYOUT
-;    Instead of 4 separate arrays, parameters are interleaved:
-;      Block k: [mu[4k:4k+3], C1[4k:4k+3], C2[4k:4k+3], inv_ssn[4k:4k+3]]
-;    Each block = 128 bytes = 2 cache lines (perfect spatial locality)
+; 1. NATIVE INTERLEAVED MEMORY LAYOUT (V3)
+;    Parameters stored directly in SIMD-friendly format, eliminating
+;    the O(n) build_interleaved() transformation from V2.
 ;
 ; 2. RUNNING INDEX VECTORS
 ;    Instead of: idx = broadcast(i) + offset  (2 µops, 3-cycle latency)
@@ -57,7 +76,7 @@
 ; void bocpd_fused_loop_avx2_generic(const bocpd_kernel_args_t *args);
 ;
 ; Input structure (bocpd_kernel_args_t):
-;   +0   double* lin_interleaved  ; Interleaved [mu×4, C1×4, C2×4, inv_ssn×4]
+;   +0   double* lin_interleaved  ; Native interleaved buffer (V3)
 ;   +8   double* r_old            ; Current run-length distribution
 ;   +16  double  x                ; New observation
 ;   +24  double  h                ; Hazard rate P(changepoint)
@@ -150,7 +169,7 @@ idx_increment:  dq 8.0, 8.0, 8.0, 8.0      ; Add 8 each iteration (2 blocks × 4
 ;------------------------------------------------------------------------------
 ; STRUCTURE FIELD OFFSETS (must match bocpd_kernel_args_t in C exactly!)
 ;------------------------------------------------------------------------------
-%define ARG_LIN_INTERLEAVED 0              ; double* - interleaved params
+%define ARG_LIN_INTERLEAVED 0              ; double* - native interleaved buffer
 %define ARG_R_OLD           8              ; double* - input distribution
 %define ARG_X               16             ; double  - observation value
 %define ARG_H               24             ; double  - hazard rate
@@ -231,7 +250,7 @@ bocpd_fused_loop_avx2_generic:
     ;==========================================================================
     ; LOAD ARGUMENTS: Move frequently-accessed values into registers
     ;==========================================================================
-    mov         r8,  [rdi + ARG_LIN_INTERLEAVED]    ; r8  = interleaved params base
+    mov         r8,  [rdi + ARG_LIN_INTERLEAVED]    ; r8  = native interleaved buffer
     mov         r12, [rdi + ARG_R_OLD]              ; r12 = input distribution
     mov         r13, [rdi + ARG_R_NEW]              ; r13 = output distribution
     mov         r14, [rdi + ARG_N_PADDED]           ; r14 = loop bound
@@ -277,25 +296,26 @@ bocpd_fused_loop_avx2_generic:
     ;==========================================================================
     ; BLOCK A: Process elements [i, i+1, i+2, i+3]
     ;
-    ; INTERLEAVED LAYOUT ADDRESS CALCULATION:
+    ; V3 INTERLEAVED LAYOUT ADDRESS CALCULATION:
     ;   Block number = i / 4 (since i is multiple of 8, i/4 is even)
-    ;   Byte offset = block_number * 128 = (i/4) * 128 = i * 32
+    ;   Byte offset = block_number * 256 = (i/4) * 256 = i * 64
     ;
-    ; Within each 128-byte block:
+    ; Within each 256-byte block (only first 128 bytes used by kernel):
     ;   mu[0:3]      at offset 0   (32 bytes)
     ;   C1[0:3]      at offset 32  (32 bytes)
     ;   C2[0:3]      at offset 64  (32 bytes)
     ;   inv_ssn[0:3] at offset 96  (32 bytes)
+    ;   (κ, α, β, ss_n at offsets 128-255 - not accessed by kernel)
     ;==========================================================================
     
     mov         rax, rsi
-    shl         rax, 5                              ; rax = i * 32 = byte offset
+    shl         rax, 6                              ; V3: rax = i * 64 (was i * 32 in V2)
     
     ; Load all 4 parameter vectors from interleaved block (2 cache lines)
     vmovapd     ymm0, [r8 + rax]                    ; ymm0 = mu[i:i+3]
     vmovapd     ymm1, [r8 + rax + 32]               ; ymm1 = C1[i:i+3]
-    vmovapd     ymm2, [r8 + rax + 64]               ; C2_a
-    vmovapd     ymm3, [r8 + rax + 96]               ; inv_ssn_a
+    vmovapd     ymm2, [r8 + rax + 64]               ; ymm2 = C2[i:i+3]
+    vmovapd     ymm3, [r8 + rax + 96]               ; ymm3 = inv_ssn[i:i+3]
     vmovapd     ymm4, [r12 + rsi*8]                 ; ymm4 = r_old[i:i+3] (input distribution)
     
     ;--------------------------------------------------------------------------
@@ -442,12 +462,12 @@ bocpd_fused_loop_avx2_generic:
     ; Block B uses separate max_growth_B accumulator (ymm14) to avoid
     ; read-after-write dependencies with Block A's ymm13.
     ;
-    ; Byte offset = (i/4 + 1) * 128 = i*32 + 128
+    ; V3: Byte offset = (i/4 + 1) * 256 = i*64 + 256
     ;==========================================================================
     
     mov         rax, rsi
-    shl         rax, 5
-    add         rax, 128                            ; Next interleaved block
+    shl         rax, 6                              ; V3: rax = i * 64
+    add         rax, 256                            ; V3: next block at +256 (was +128 in V2)
     
     ; Load Block B parameters
     vmovapd     ymm0, [r8 + rax]                    ; mu[i+4:i+7]
