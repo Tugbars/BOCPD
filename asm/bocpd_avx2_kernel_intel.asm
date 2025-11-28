@@ -4,12 +4,13 @@
 ;
 ; Fixed issues:
 ;   1. Correct 256-byte superblock addressing (V3 layout)
-;   2. No register clobbering (r_old_B uses memory operand)
+;   2. No register clobbering (r_old_B uses stack)
 ;   3. Correct r_new store offsets
 ;   4. Fast horizontal reduction (no vhaddpd)
 ;   5. bsr for truncation (no bt chain)
 ;   6. Consistent stack layout with defines
 ;   7. Correct epilogue stack math
+;   8. Stack frame padding for alignment safety
 ;
 ; Performance: ~3M obs/sec on Intel i9
 ; ============================================================================
@@ -65,7 +66,17 @@ idx_increment:  dq 8.0, 8.0, 8.0, 8.0
 %define ARG_LAST_VALID        88
 
 ; ============================================================================
-; STACK LAYOUT (256 bytes, 32-byte aligned)
+; STACK LAYOUT (288 bytes with alignment padding, 32-byte aligned)
+;
+; Layout after alignment:
+;   [rsp + 0]     idx_vec_A      (32 bytes)
+;   [rsp + 32]    idx_vec_B      (32 bytes)
+;   [rsp + 64]    max_idx_A      (32 bytes)
+;   [rsp + 96]    max_idx_B      (32 bytes)
+;   [rsp + 128]   max_growth_A   (32 bytes)
+;   [rsp + 160]   max_growth_B   (32 bytes)
+;   [rsp + 192]   r_old_B        (32 bytes)
+;   [rsp + 224]   padding        (64 bytes for alignment safety)
 ; ============================================================================
 
 %define STK_IDX_VEC_A       0
@@ -76,7 +87,7 @@ idx_increment:  dq 8.0, 8.0, 8.0, 8.0
 %define STK_MAX_GROWTH_B    160
 %define STK_R_OLD_B         192
 
-%define STACK_FRAME         256
+%define STACK_FRAME         288      ; 256 + 32 alignment padding
 
 ; ============================================================================
 ; KERNEL ENTRY — Windows x64 ABI
@@ -116,6 +127,7 @@ bocpd_fused_loop_avx2_win:
 
     ; --------------------------------------------------------
     ; STACK FRAME — 32-byte aligned for AVX
+    ; Extra 32 bytes padding ensures no overlap after alignment
     ; --------------------------------------------------------
     mov         rbp, rsp
     sub         rsp, STACK_FRAME
