@@ -39,8 +39,8 @@ Measured on Intel Core i9-14900K, GCC 12, `-O3 -mavx2 -mfma`:
 
 | Kernel | Throughput | Latency (n=256) | Target |
 |--------|------------|-----------------|--------|
-| **Generic** | 510K obs/sec | ~2.0 µs | AMD Zen1-4, all Intel |
-| **Intel-tuned** | 525K obs/sec | ~1.9 µs | Intel 12th-14th gen |
+| **Generic** | 1.45M obs/sec | ~0.7 µs | AMD Zen1-4, all Intel |
+| **Intel-tuned** | 1.54M obs/sec | ~0.6 µs | Intel 12th-14th gen |
 
 ### Scaling
 
