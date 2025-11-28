@@ -1211,12 +1211,25 @@ static inline void store_shifted_field(double *buf, size_t block_idx,
  *─────────────────────────────────────────────────────────────────────────────*/
 
 /**
- * @brief Initialize slot 0 of NEXT buffer with prior parameters
+ * @brief Initialize block 0 of NEXT buffer with prior parameters
  *
  * @param b  Pointer to BOCPD detector
  *
  * This sets up the "fresh start" hypothesis: what if a changepoint
  * just occurred and we're starting from the prior?
+ *
+ * CRITICAL: We must initialize ALL 4 LANES of block 0, not just lane 0!
+ *
+ * The SIMD processing loads entire 4-element vectors. Even though only
+ * lane 0 represents a valid run-length at slot 0, the other lanes must
+ * contain valid (non-zero, non-NaN) values to avoid:
+ *   - Division by zero in sigma_sq computation
+ *   - NaN propagation through lgamma
+ *   - Crashes from invalid floating-point operations
+ *
+ * We broadcast the prior values to all 4 lanes. The extra lanes will be
+ * ignored in the output (only r[0] matters for slot 0), but they must
+ * be valid to prevent computational errors during SIMD processing.
  */
 static inline void init_slot_zero(bocpd_asm_t *b)
 {
@@ -1227,15 +1240,6 @@ static inline void init_slot_zero(bocpd_asm_t *b)
     const double mu0 = b->prior.mu0;       /* Prior mean */
     const double alpha0 = b->prior.alpha0; /* Shape (half degrees of freedom) */
     const double beta0 = b->prior.beta0;   /* Scale (sum of squares / 2) */
-
-    /* ─────────────────────────────────────────────────────────────────────
-     * Store raw posterior parameters at slot 0
-     * ───────────────────────────────────────────────────────────────────── */
-    IBLK_SET_MU(next, 0, mu0);
-    IBLK_SET_KAPPA(next, 0, kappa0);
-    IBLK_SET_ALPHA(next, 0, alpha0);
-    IBLK_SET_BETA(next, 0, beta0);
-    IBLK_SET_SS_N(next, 0, 0.0); /* No samples yet */
 
     /* ─────────────────────────────────────────────────────────────────────
      * Compute Student-t predictive parameters
@@ -1270,10 +1274,33 @@ static inline void init_slot_zero(bocpd_asm_t *b)
     double C1 = b->prior_lgamma_alpha_p5 - b->prior_lgamma_alpha -
                 0.5 * ln_nu_pi - 0.5 * ln_sigma_sq;
     double C2 = alpha0 + 0.5;
+    double inv_ssn = 1.0 / (sigma_sq * nu);
 
-    IBLK_SET_C1(next, 0, C1);
-    IBLK_SET_C2(next, 0, C2);
-    IBLK_SET_INV_SSN(next, 0, 1.0 / (sigma_sq * nu));
+    /* ─────────────────────────────────────────────────────────────────────
+     * BROADCAST to all 4 lanes of block 0
+     *
+     * This is essential! SIMD loads read 4 doubles at once. Even though
+     * only lane 0 is "active", lanes 1-3 must contain valid values to
+     * prevent NaN/Inf propagation and division-by-zero crashes.
+     * ───────────────────────────────────────────────────────────────────── */
+    __m256d v_mu = _mm256_set1_pd(mu0);
+    __m256d v_kappa = _mm256_set1_pd(kappa0);
+    __m256d v_alpha = _mm256_set1_pd(alpha0);
+    __m256d v_beta = _mm256_set1_pd(beta0);
+    __m256d v_ss_n = _mm256_set1_pd(0.0); /* No samples yet */
+    __m256d v_C1 = _mm256_set1_pd(C1);
+    __m256d v_C2 = _mm256_set1_pd(C2);
+    __m256d v_inv_ssn = _mm256_set1_pd(inv_ssn);
+
+    /* Store all 8 fields to block 0 (each store writes 4 lanes) */
+    _mm256_storeu_pd(next + BOCPD_IBLK_MU / 8, v_mu);
+    _mm256_storeu_pd(next + BOCPD_IBLK_KAPPA / 8, v_kappa);
+    _mm256_storeu_pd(next + BOCPD_IBLK_ALPHA / 8, v_alpha);
+    _mm256_storeu_pd(next + BOCPD_IBLK_BETA / 8, v_beta);
+    _mm256_storeu_pd(next + BOCPD_IBLK_SS_N / 8, v_ss_n);
+    _mm256_storeu_pd(next + BOCPD_IBLK_C1 / 8, v_C1);
+    _mm256_storeu_pd(next + BOCPD_IBLK_C2 / 8, v_C2);
+    _mm256_storeu_pd(next + BOCPD_IBLK_INV_SSN / 8, v_inv_ssn);
 }
 
 /*─────────────────────────────────────────────────────────────────────────────
@@ -1593,11 +1620,18 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
 
     /* ═════════════════════════════════════════════════════════════════════
      * REGION 1: Pure Lanczos (all α < 8)
+     *
+     * Guard: block * 4 + 3 >= n_old means the last lane (index 3) would
+     * be invalid. We must NOT process partial blocks with SIMD because:
+     *   1. Loads would read uninitialized data in lanes beyond n_old
+     *   2. store_shifted_field writes to block k+1, potentially OOB
+     * The scalar tail handles any remaining elements safely.
      * ═════════════════════════════════════════════════════════════════════ */
     for (; block < lanczos_safe_end && block < n_blocks; block++)
     {
-        if (block * 4 >= n_old)
-            break;
+        size_t start = block * 4;
+        if (start + 3 >= n_old)
+            break; /* Prevent partial block processing */
         const double *src = cur + block * BOCPD_IBLK_DOUBLES;
         process_block_common(src, next, block, x_vec, one, two, half, pi,
                              lgamma_lanczos_avx2);
@@ -1608,8 +1642,9 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
      * ═════════════════════════════════════════════════════════════════════ */
     for (; block < minimax_safe_start && block < n_blocks; block++)
     {
-        if (block * 4 >= n_old)
-            break;
+        size_t start = block * 4;
+        if (start + 3 >= n_old)
+            break; /* Prevent partial block processing */
         const double *src = cur + block * BOCPD_IBLK_DOUBLES;
         process_block_common(src, next, block, x_vec, one, two, half, pi,
                              fast_lgamma_avx2_branchless); /* Computes all 3 */
@@ -1620,8 +1655,9 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
      * ═════════════════════════════════════════════════════════════════════ */
     for (; block < minimax_safe_end && block < n_blocks; block++)
     {
-        if (block * 4 >= n_old)
-            break;
+        size_t start = block * 4;
+        if (start + 3 >= n_old)
+            break; /* Prevent partial block processing */
         const double *src = cur + block * BOCPD_IBLK_DOUBLES;
         process_block_common(src, next, block, x_vec, one, two, half, pi,
                              lgamma_minimax_avx2);
@@ -1632,8 +1668,9 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
      * ═════════════════════════════════════════════════════════════════════ */
     for (; block < stirling_safe_start && block < n_blocks; block++)
     {
-        if (block * 4 >= n_old)
-            break;
+        size_t start = block * 4;
+        if (start + 3 >= n_old)
+            break; /* Prevent partial block processing */
         const double *src = cur + block * BOCPD_IBLK_DOUBLES;
         process_block_common(src, next, block, x_vec, one, two, half, pi,
                              fast_lgamma_avx2_branchless); /* Computes all 3 */
@@ -1644,8 +1681,9 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
      * ═════════════════════════════════════════════════════════════════════ */
     for (; block < n_blocks; block++)
     {
-        if (block * 4 >= n_old)
-            break;
+        size_t start = block * 4;
+        if (start + 3 >= n_old)
+            break; /* Prevent partial block processing */
         const double *src = cur + block * BOCPD_IBLK_DOUBLES;
         process_block_common(src, next, block, x_vec, one, two, half, pi,
                              lgamma_stirling_avx2);
@@ -2212,7 +2250,22 @@ void bocpd_ultra_step(bocpd_asm_t *b, double x)
     if (!b)
         return;
 
-    /* First observation: special initialization */
+    /* ═══════════════════════════════════════════════════════════════════════
+     * First observation: special initialization
+     *
+     * At t=0, we have no prior run-lengths. We initialize with:
+     *   - r[0] = 1.0 (certain we're at run-length 0)
+     *   - Posterior parameters after seeing first observation x
+     *
+     * CRITICAL: We must initialize ALL 4 LANES of block 0!
+     *
+     * Even though only lane 0 (index 0) is semantically valid at t=0,
+     * the SIMD code loads 4-element vectors. If lanes 1-3 contain zeros,
+     * subsequent processing will cause division-by-zero (kappa=0, alpha=0)
+     * and NaN propagation, leading to crashes.
+     *
+     * Solution: Broadcast the same valid values to all 4 lanes.
+     * ═══════════════════════════════════════════════════════════════════════ */
     if (b->t == 0)
     {
         b->r[0] = 1.0;
@@ -2221,28 +2274,46 @@ void bocpd_ultra_step(bocpd_asm_t *b, double x)
         double k0 = b->prior.kappa0, mu0 = b->prior.mu0;
         double a0 = b->prior.alpha0, b0 = b->prior.beta0;
 
-        /* First posterior update */
+        /* First posterior update using Welford's form */
         double k1 = k0 + 1.0;
         double mu1 = (k0 * mu0 + x) / k1;
         double a1 = a0 + 0.5;
         double beta1 = b0 + 0.5 * (x - mu0) * (x - mu1);
 
-        IBLK_SET_MU(cur, 0, mu1);
-        IBLK_SET_KAPPA(cur, 0, k1);
-        IBLK_SET_ALPHA(cur, 0, a1);
-        IBLK_SET_BETA(cur, 0, beta1);
-        IBLK_SET_SS_N(cur, 0, 1.0);
-
+        /* Student-t predictive parameters */
         double sigma_sq = beta1 * (k1 + 1.0) / (a1 * k1);
         double nu = 2.0 * a1;
         double lg_a = lgamma(a1);
         double lg_ap5 = lgamma(a1 + 0.5);
         double C1 = lg_ap5 - lg_a - 0.5 * fast_log_scalar(nu * M_PI * sigma_sq);
         double C2 = a1 + 0.5;
+        double inv_ssn = 1.0 / (sigma_sq * nu);
 
-        IBLK_SET_C1(cur, 0, C1);
-        IBLK_SET_C2(cur, 0, C2);
-        IBLK_SET_INV_SSN(cur, 0, 1.0 / (sigma_sq * nu));
+        /* ─────────────────────────────────────────────────────────────────────
+         * BROADCAST to all 4 lanes of block 0
+         *
+         * This prevents crashes from uninitialized lanes causing:
+         *   - Division by zero (kappa=0, alpha=0)
+         *   - NaN in lgamma calls
+         *   - Inf in 1/0 computations
+         * ───────────────────────────────────────────────────────────────────── */
+        __m256d v_mu = _mm256_set1_pd(mu1);
+        __m256d v_kappa = _mm256_set1_pd(k1);
+        __m256d v_alpha = _mm256_set1_pd(a1);
+        __m256d v_beta = _mm256_set1_pd(beta1);
+        __m256d v_ss_n = _mm256_set1_pd(1.0);
+        __m256d v_C1 = _mm256_set1_pd(C1);
+        __m256d v_C2 = _mm256_set1_pd(C2);
+        __m256d v_inv_ssn = _mm256_set1_pd(inv_ssn);
+
+        _mm256_storeu_pd(cur + BOCPD_IBLK_MU / 8, v_mu);
+        _mm256_storeu_pd(cur + BOCPD_IBLK_KAPPA / 8, v_kappa);
+        _mm256_storeu_pd(cur + BOCPD_IBLK_ALPHA / 8, v_alpha);
+        _mm256_storeu_pd(cur + BOCPD_IBLK_BETA / 8, v_beta);
+        _mm256_storeu_pd(cur + BOCPD_IBLK_SS_N / 8, v_ss_n);
+        _mm256_storeu_pd(cur + BOCPD_IBLK_C1 / 8, v_C1);
+        _mm256_storeu_pd(cur + BOCPD_IBLK_C2 / 8, v_C2);
+        _mm256_storeu_pd(cur + BOCPD_IBLK_INV_SSN / 8, v_inv_ssn);
 
         b->active_len = 1;
         b->t = 1;
