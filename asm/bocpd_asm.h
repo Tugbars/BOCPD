@@ -131,6 +131,7 @@ void bocpd_pool_reset(bocpd_pool_t *pool);
 bocpd_asm_t *bocpd_pool_get(bocpd_pool_t *pool, size_t index);
 
 /* Assembly kernel interface - now reads directly from interleaved buffer */
+/* Assembly kernel interface - now reads directly from interleaved buffer */
 typedef struct bocpd_kernel_args {
     const double *lin_interleaved;  /* Points to BOCPD_CUR_BUF(b) */
     const double *r_old;
@@ -146,9 +147,36 @@ typedef struct bocpd_kernel_args {
     size_t *last_valid_out;
 } bocpd_kernel_args_t;
 
-extern void bocpd_fused_loop_avx2_generic(bocpd_kernel_args_t *args);
+/*=============================================================================
+ * KERNEL SELECTION
+ *
+ * BOCPD_USE_INTEL_KERNEL=1  → Intel-optimized ASM (i9, Alder/Raptor Lake)
+ * BOCPD_USE_INTEL_KERNEL=0  → Generic ASM (AMD Zen, older Intel, default)
+ *
+ * Set via compiler flag: -DBOCPD_USE_INTEL_KERNEL=1
+ *============================================================================*/
 
-#define bocpd_fused_loop_avx2(args) bocpd_fused_loop_avx2_generic(args)
+#ifndef BOCPD_USE_INTEL_KERNEL
+#define BOCPD_USE_INTEL_KERNEL 1
+#endif
+
+#ifdef _WIN32
+    #if BOCPD_USE_INTEL_KERNEL
+        extern void bocpd_fused_loop_avx2_win(bocpd_kernel_args_t *args);
+        #define bocpd_fused_loop_avx2(args) bocpd_fused_loop_avx2_win(args)
+    #else
+        extern void bocpd_fused_loop_avx2_generic(bocpd_kernel_args_t *args);
+        #define bocpd_fused_loop_avx2(args) bocpd_fused_loop_avx2_generic(args)
+    #endif
+#else
+    #if BOCPD_USE_INTEL_KERNEL
+        extern void bocpd_fused_loop_avx2_sysv(bocpd_kernel_args_t *args);
+        #define bocpd_fused_loop_avx2(args) bocpd_fused_loop_avx2_sysv(args)
+    #else
+        extern void bocpd_fused_loop_avx2_generic(bocpd_kernel_args_t *args);
+        #define bocpd_fused_loop_avx2(args) bocpd_fused_loop_avx2_generic(args)
+    #endif
+#endif
 
 #ifdef __cplusplus
 }

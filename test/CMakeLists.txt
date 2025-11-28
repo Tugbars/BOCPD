@@ -74,6 +74,13 @@ add_custom_command(
 set(ASM_KERNEL_INTEL_SRC ${ASM_DIR}/bocpd_avx2_kernel_intel.asm)
 set(ASM_KERNEL_INTEL_OBJ ${CMAKE_CURRENT_BINARY_DIR}/bocpd_avx2_kernel_intel.o)
 
+add_custom_command(
+    OUTPUT ${ASM_KERNEL_INTEL_OBJ}
+    COMMAND ${NASM_EXECUTABLE} -f ${NASM_FORMAT} -o ${ASM_KERNEL_INTEL_OBJ} ${ASM_KERNEL_INTEL_SRC}
+    DEPENDS ${ASM_KERNEL_INTEL_SRC}
+    COMMENT "Assembling Intel AVX2 kernel..."
+)
+
 if(EXISTS ${ASM_KERNEL_INTEL_SRC})
     add_custom_command(
         OUTPUT ${ASM_KERNEL_INTEL_OBJ}
@@ -132,8 +139,9 @@ endif()
 
 add_library(bocpd_asm STATIC
     ${ASM_DIR}/bocpd_ultra_opt_asm.c
-    ${ASM_DIR}/bocpd_asm.h
-    ${ASM_KERNEL_OBJ}
+    ${ASM_DIR}/bocpd_asm.h              # Optional but recommended
+    ${ASM_KERNEL_GENERIC_OBJ}
+    ${ASM_KERNEL_INTEL_OBJ}
 )
 
 add_dependencies(bocpd_asm asm_kernels)
