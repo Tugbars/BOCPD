@@ -186,6 +186,38 @@ if(UNIX OR MINGW)
 endif()
 
 #===============================================================================
+# Naive vs Optimized Benchmark
+#===============================================================================
+
+add_executable(test_naiveBench
+    ${TEST_DIR}/test_naiveBench.c
+)
+
+target_link_libraries(test_naiveBench PRIVATE bocpd_asm)
+target_include_directories(test_naiveBench PRIVATE ${ASM_DIR})
+target_compile_options(test_naiveBench PRIVATE ${BOCPD_COMPILE_FLAGS})
+target_compile_definitions(test_naiveBench PRIVATE STANDALONE)
+
+if(WIN32 AND MINGW)
+    target_link_options(test_naiveBench PRIVATE -mconsole)
+endif()
+
+if(UNIX OR MINGW)
+    target_link_libraries(test_naiveBench PRIVATE m)
+endif()
+
+# Add to CTest
+add_test(NAME NaiveBench COMMAND test_naiveBench)
+set_tests_properties(NaiveBench PROPERTIES TIMEOUT 120)
+
+# Custom target to run it
+add_custom_target(run_naive_bench
+    COMMAND test_naiveBench
+    DEPENDS test_naiveBench
+    COMMENT "Running Naive vs Optimized benchmark..."
+)
+
+#===============================================================================
 # CTest Integration
 #===============================================================================
 
