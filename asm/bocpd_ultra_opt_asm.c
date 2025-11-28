@@ -604,6 +604,11 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
 
 /** @} */ /* End of init_update group */
 
+
+
+
+
+
 /*=============================================================================
  * @defgroup prediction Prediction Step
  * @brief Compute predictive probabilities and update run-length distribution
@@ -630,6 +635,103 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
  * 4. Changepoint: r0 += r[i] × pp × h
  * 5. Normalize r_new to sum to 1
  */
+
+
+#if BOCPD_USE_ASM_KERNEL
+
+static void prediction_step(bocpd_asm_t *b, double x)
+{
+    const size_t n = b->active_len;
+    if (n == 0) return;
+
+    const double thresh = b->trunc_thresh;
+
+    /* V3: No build_interleaved() needed - data already in native format! */
+    double *params = BOCPD_CUR_BUF(b);  /* Read directly from interleaved buffer */
+
+    double *r = b->r;
+    double *r_new = b->r_scratch;
+
+    const size_t n_padded = (n + 7) & ~7ULL;
+
+    /* Zero-pad input beyond active length */
+    for (size_t i = n; i < n_padded + 8; i++)
+        r[i] = 0.0;
+
+    /* Zero output buffer */
+    memset(r_new, 0, (n_padded + 16) * sizeof(double));
+
+    /* Output variables for kernel */
+    double r0_out = 0.0;
+    double max_growth_out = 0.0;
+    size_t max_idx_out = 0;
+    size_t last_valid_out = 0;
+
+    /* Package arguments for assembly kernel */
+    bocpd_kernel_args_t args = {
+        .lin_interleaved = params,  /* V3: direct pointer, no transformation */
+        .r_old = r,
+        .x = x,
+        .h = b->hazard,
+        .one_minus_h = b->one_minus_h,
+        .trunc_thresh = thresh,
+        .n_padded = n_padded,
+        .r_new = r_new,
+        .r0_out = &r0_out,
+        .max_growth_out = &max_growth_out,
+        .max_idx_out = &max_idx_out,
+        .last_valid_out = &last_valid_out
+    };
+
+    /* Call assembly kernel */
+    bocpd_fused_loop_avx2(&args);
+
+    /* Assembly writes to *r0_out, not r_new[0] */
+    r_new[0] = r0_out;
+
+    if (r0_out > thresh && last_valid_out == 0)
+        last_valid_out = 1;
+
+    /* Determine new active length */
+    size_t new_len = (last_valid_out > 0) ? last_valid_out + 1 : n + 1;
+    if (new_len > b->capacity)
+        new_len = b->capacity;
+
+    size_t new_len_padded = (new_len + 7) & ~7ULL;
+
+    /* Normalize distribution */
+    __m256d sum_acc = _mm256_setzero_pd();
+    for (size_t i = 0; i < new_len_padded; i += 4)
+        sum_acc = _mm256_add_pd(sum_acc, _mm256_loadu_pd(&r_new[i]));
+
+    __m128d lo = _mm256_castpd256_pd128(sum_acc);
+    __m128d hi = _mm256_extractf128_pd(sum_acc, 1);
+    lo = _mm_add_pd(lo, hi);
+    lo = _mm_add_pd(lo, _mm_shuffle_pd(lo, lo, 1));
+    double r_sum = _mm_cvtsd_f64(lo);
+
+    if (r_sum > 1e-300) {
+        __m256d inv_sum = _mm256_set1_pd(1.0 / r_sum);
+        for (size_t i = 0; i < new_len_padded; i += 4) {
+            __m256d rv = _mm256_loadu_pd(&r_new[i]);
+            _mm256_storeu_pd(&r[i], _mm256_mul_pd(rv, inv_sum));
+        }
+    }
+
+    b->active_len = new_len;
+
+    /* Determine MAP run length */
+    double r0_normalized = (r_sum > 1e-300) ? r0_out / r_sum : 0.0;
+    double max_normalized = (r_sum > 1e-300) ? max_growth_out / r_sum : 0.0;
+
+    if (r0_normalized >= max_normalized)
+        b->map_runlength = 0;
+    else
+        b->map_runlength = max_idx_out;
+}
+
+#else /* !BOCPD_USE_ASM_KERNEL - C intrinsics fallback */
+
 static void prediction_step(bocpd_asm_t *b, double x)
 {
     const size_t n = b->active_len;
@@ -837,6 +939,7 @@ static void prediction_step(bocpd_asm_t *b, double x)
     b->active_len = new_len;
     b->map_runlength = map_idx;
 }
+#endif
 
 /** @} */ /* End of prediction group */
 
