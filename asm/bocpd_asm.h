@@ -178,6 +178,68 @@ typedef struct bocpd_kernel_args {
     #endif
 #endif
 
+/*=============================================================================
+ * OPENMP PARALLEL SUPPORT (Experimental)
+ *
+ * Simple parallelization across detectors. For maximum throughput with many
+ * cores (16+), consider future SoA (Structure of Arrays) redesign that
+ * processes multiple detectors per SIMD lane.
+ *
+ * Current approach: SIMD across run-lengths, OpenMP across detectors
+ * Future work:      SIMD across detectors (SoA) for better cache scaling
+ *============================================================================*/
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+/**
+ * @brief Process all pool detectors in parallel (one time step)
+ * @param pool      Detector pool
+ * @param obs       Array of observations [n_detectors]
+ */
+static inline void bocpd_pool_step_parallel(bocpd_pool_t *pool,
+                                            const double *obs)
+{
+#ifdef _OPENMP
+    const int n = (int)pool->n_detectors;
+    
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; i++) {
+        bocpd_ultra_step(&pool->detectors[i], obs[i]);
+    }
+#else
+    /* Fallback to sequential */
+    for (size_t i = 0; i < pool->n_detectors; i++) {
+        bocpd_ultra_step(&pool->detectors[i], obs[i]);
+    }
+#endif
+}
+
+/**
+ * @brief Get current thread count (for diagnostics)
+ */
+static inline int bocpd_get_num_threads(void)
+{
+#ifdef _OPENMP
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
+}
+
+/**
+ * @brief Set thread count for parallel operations
+ */
+static inline void bocpd_set_num_threads(int n)
+{
+#ifdef _OPENMP
+    omp_set_num_threads(n);
+#else
+    (void)n;
+#endif
+}
+
 #ifdef __cplusplus
 }
 #endif
