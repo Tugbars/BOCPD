@@ -286,6 +286,21 @@ if(ENABLE_ASAN)
     endif()
 endif()
 
+
+#===============================================================================
+# OpenMP parallelization
+#===============================================================================
+
+option(BOCPD_USE_OPENMP "Enable OpenMP parallelization" ON)
+
+if(BOCPD_USE_OPENMP)
+    find_package(OpenMP)
+    if(OpenMP_C_FOUND)
+        target_link_libraries(bocpd_asm PUBLIC OpenMP::OpenMP_C)
+        target_compile_definitions(bocpd_asm PUBLIC BOCPD_OPENMP_ENABLED)
+    endif()
+endif()
+
 #===============================================================================
 # Build Summary
 #===============================================================================
