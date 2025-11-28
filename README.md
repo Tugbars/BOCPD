@@ -19,17 +19,19 @@ BOCPD maintains a probability distribution over "run lengths" — time since the
 | Method | Latency | Detects | Online |
 |--------|---------|---------|--------|
 | CUSUM | ~100ns | Mean shift | ✓ |
-| **BOCPD** | **~0.7µs** | **Mean + Variance** | **✓** |
+| **BOCPD** | **~0.33µs** | **Mean + Variance** | **✓** |
 | HMM | ~50µs | Regimes | ✓ |
 | Offline CPD | ~10ms | All | ✗ |
 
 **Benchmark Results (Intel Core i9):**
 
-| Configuration | Latency | Throughput |
-|---------------|---------|------------|
-| Single detector | 0.70 µs | 1.42M obs/sec |
-| Pool (100 instruments) | 0.58 µs | 1.72M obs/sec |
-| Large scale (380 instruments) | 0.87 µs | 1.15M obs/sec |
+| Configuration | Throughput | Latency |
+|---------------|------------|---------|
+| Single detector | 1.75M obs/sec | 0.57 µs |
+| With changepoints | 3.01M obs/sec | 0.33 µs |
+| Pool (100 instruments) | 2.29M obs/sec | 0.44 µs |
+| Large scale (380 instruments) | 1.58M obs/sec | 0.63 µs |
+| **Peak throughput** | **3.01M obs/sec** | **0.33 µs** |
 
 ---
 
@@ -37,27 +39,37 @@ BOCPD maintains a probability distribution over "run lengths" — time since the
 
 Measured on Intel Core i9-14900K, GCC 12, `-O3 -mavx2 -mfma`:
 
-| Kernel | Throughput | Latency (n=256) | Target |
-|--------|------------|-----------------|--------|
-| **Generic** | 1.45M obs/sec | ~0.7 µs | AMD Zen1-4, all Intel |
-| **Intel-tuned** | 1.54M obs/sec | ~0.6 µs | Intel 12th-14th gen |
+### V3.1 Native Interleaved Layout + AVX2 ASM Kernel
 
-### Scaling
+| Test Scenario | Throughput | Latency | Speedup vs Naive |
+|---------------|------------|---------|------------------|
+| Single detector | 1.75M obs/sec | 0.57 µs | 33.5× |
+| Stationary data (100K obs) | 1.42M obs/sec | 0.70 µs | 27× |
+| With changepoints (100K obs) | 3.01M obs/sec | 0.33 µs | 57× |
+| Multi-detector pool (100) | 2.29M obs/sec | 0.44 µs | 12.9× |
+| Large scale (380 × 500) | 1.58M obs/sec | 0.63 µs | - |
 
-| Active Length | Throughput | Latency |
-|---------------|------------|---------|
-| 64 | 766K obs/sec | 1.3 µs |
-| 256 | 525K obs/sec | 1.9 µs |
-| 1024 | 486K obs/sec | 2.1 µs |
-| 4096 | 469K obs/sec | 2.1 µs |
+### Scaling by max_run_length
+
+| max_run | Throughput | avg_active |
+|---------|------------|------------|
+| 64 | 1.81M obs/sec | 41.3 |
+| 128 | 1.30M obs/sec | 53.1 |
+| 256 | 1.37M obs/sec | 56.5 |
+| 512 | 1.27M obs/sec | 61.4 |
+| 1024 | 1.22M obs/sec | 62.8 |
+| 2048 | 1.39M obs/sec | 56.0 |
+| 4096 | 1.29M obs/sec | 61.2 |
 
 ### vs Reference Implementations
 
-| Implementation | Latency (n=200) | Relative |
-|----------------|-----------------|----------|
-| Python (numpy) | 850 µs | 1× |
-| Rust (changepoint) | 45 µs | 19× |
-| **BOCPD Ultra** | **~2 µs** | **425×** |
+| Implementation | Throughput | Relative |
+|----------------|------------|----------|
+| Python (numpy) | ~1.2K obs/sec | 1× |
+| Rust (changepoint) | ~22K obs/sec | 18× |
+| Naive C | 52K obs/sec | 43× |
+| **BOCPD Ultra V3.1** | **1.75M obs/sec** | **1,458×** |
+| **Peak (with changepoints)** | **3.01M obs/sec** | **2,508×** |
 
 ---
 
@@ -95,7 +107,6 @@ The key signal is **not** r[0] directly, but:
 
 1. **MAP drop**: argmax(r) suddenly falls from high to low
 2. **Short-run probability**: P(r < k) spikes at changepoints
-
 ```
 Time:    1   2   3   4   5   6   7   8   9  10  11  12
 Data:    ~~~~~~~~~~~~ normal ~~~~~~~~~~~~  | !! SHIFT !!
@@ -109,34 +120,59 @@ P(r<5):  .9  .5  .3  .2  .1  .1  .1  .1  .1  .8  .6  .4
 
 ## Optimizations
 
-This section details the engineering that achieves 525K obs/sec.
+This section details the engineering that achieves **3.01M obs/sec peak throughput**.
 
-### Memory Layout: Interleaved Blocks
+### V3 Native Interleaved Memory Layout
 
-**Problem:** Four parameter arrays (μ, C₁, C₂, 1/σ²ν) accessed together cause 4 cache line fetches per SIMD load.
+**Problem:** V2 required O(n) `build_interleaved()` transformation every observation to convert separate arrays into SIMD-friendly format.
 
-**Solution:** Interleave into 128-byte blocks (2 cache lines):
-
+**Solution:** Store parameters directly in 256-byte superblocks:
 ```
-Traditional layout (4 separate arrays):
-  mu[]:     [μ₀ μ₁ μ₂ μ₃ | μ₄ μ₅ μ₆ μ₇ | ...]   ← cache line 1
-  C1[]:     [c₀ c₁ c₂ c₃ | c₄ c₅ c₆ c₇ | ...]   ← cache line 2
-  C2[]:     [d₀ d₁ d₂ d₃ | d₄ d₅ d₆ d₇ | ...]   ← cache line 3
-  inv_ssn[]:[e₀ e₁ e₂ e₃ | e₄ e₅ e₆ e₇ | ...]   ← cache line 4
+V2 Layout (separate arrays + staging buffer):
+  mu[]:      [μ₀ μ₁ μ₂ μ₃ ...]     ← separate allocation
+  C1[]:      [c₀ c₁ c₂ c₃ ...]     ← separate allocation
+  C2[]:      [d₀ d₁ d₂ d₃ ...]     ← separate allocation
+  inv_ssn[]: [e₀ e₁ e₂ e₃ ...]     ← separate allocation
+  
+  build_interleaved(): O(n) copy every step!
 
-Interleaved layout (single array):
-  Block 0: [μ₀ μ₁ μ₂ μ₃ | c₀ c₁ c₂ c₃ | d₀ d₁ d₂ d₃ | e₀ e₁ e₂ e₃]  ← 2 cache lines
-  Block 1: [μ₄ μ₅ μ₆ μ₇ | c₄ c₅ c₆ c₇ | d₄ d₅ d₆ d₇ | e₄ e₅ e₆ e₇]  ← 2 cache lines
+V3 Layout (native 256-byte superblocks):
+  Block 0 (bytes 0-255):
+    [μ₀ μ₁ μ₂ μ₃]     offset 0    (prediction)
+    [c₀ c₁ c₂ c₃]     offset 32   (prediction)
+    [d₀ d₁ d₂ d₃]     offset 64   (prediction)
+    [e₀ e₁ e₂ e₃]     offset 96   (prediction)
+    [κ₀ κ₁ κ₂ κ₃]     offset 128  (update)
+    [α₀ α₁ α₂ α₃]     offset 160  (update)
+    [β₀ β₁ β₂ β₃]     offset 192  (update)
+    [n₀ n₁ n₂ n₃]     offset 224  (update)
+  Block 1 (bytes 256-511):
+    ... next 4 elements ...
 ```
 
-**Impact:** ~2% improvement at large n, better prefetch behavior.
+**Impact:** Eliminated O(n) copy, direct SIMD access. ~20% overall speedup.
+
+### Shifted Store with AVX2 Permute
+
+**Problem:** Ping-pong update reads from index i, writes to index i+1. With interleaved blocks, this crosses block boundaries.
+
+**Solution:** Use `vpermpd` to rotate vector, `vblendpd` to merge with existing blocks:
+```asm
+; Input: [v0, v1, v2, v3] for indices [i, i+1, i+2, i+3]
+; Output: write to indices [i+1, i+2, i+3, i+4] spanning two blocks
+
+vpermpd     ymm_rot, ymm_vals, 0x93    ; [v3, v0, v1, v2]
+vblendpd    ymm_k,  ymm_exist_k,  ymm_rot, 0b1110  ; block k: lanes 1,2,3
+vblendpd    ymm_k1, ymm_exist_k1, ymm_rot, 0b0001  ; block k+1: lane 0
+```
+
+**Performance:** 6 cycles vs ~16 cycles for scalar stores.
 
 ### Polynomial Approximations
 
 #### log1p via Horner's Method
 
 The Student-t log-pdf requires log(1 + t) where t = z²/σ²ν.
-
 ```
 log(1+t) ≈ t · (c₁ + t·(c₂ + t·(c₃ + t·(c₄ + t·(c₅ + t·c₆)))))
 
@@ -151,14 +187,10 @@ Horner's method: 6 FMAs, fully pipelined, ~15 cycles vs ~100 for libm log().
 **Problem:** Horner's method for exp() has 6-deep dependency chain.
 
 **Solution:** Estrin's scheme groups terms to reduce depth:
-
 ```
 exp(x) = 2^k · 2^f   where k = round(x/ln2), f = frac(x/ln2), |f| ≤ 0.5
 
 2^f ≈ 1 + f·c₁ + f²·c₂ + f³·c₃ + f⁴·c₄ + f⁵·c₅ + f⁶·c₆
-
-Horner (depth 6):
-  ((((c₆·f + c₅)·f + c₄)·f + c₃)·f + c₂)·f + c₁)·f + 1
 
 Estrin (depth 4):
   p01 = 1 + f·c₁           }
@@ -180,7 +212,6 @@ Estrin (depth 4):
 #### IEEE-754 Exponent Reconstruction
 
 Computing 2^k without libm:
-
 ```asm
 vcvtpd2dq   xmm0, ymm_k          ; k → int32
 vpmovsxdq   ymm0, xmm0           ; sign-extend to int64
@@ -191,61 +222,69 @@ vpsllq      ymm0, ymm0, 52       ; shift to exponent field
 
 Direct bit manipulation: 4 integer ops vs expensive floating-point pow().
 
-### SIMD Strategy: Dual-Block ILP
+### SIMD Strategy: Dual-Block Processing
 
 **Problem:** Single 4-wide AVX2 block leaves FMA units underutilized during memory latency.
 
-**Solution:** Process 8 elements per iteration as two interleaved 4-wide blocks:
-
+**Solution:** Process 8 elements per iteration as two 4-wide blocks:
 ```
-Iteration structure (Generic kernel):
+Block addressing (V3 layout):
+  Block A: byte_offset = (i / 4) * 256
+  Block B: byte_offset = (i / 4) * 256 + 256
+
+Iteration structure:
   Block A: load → z² → t → log1p → exp → update → store
   Block B: load → z² → t → log1p → exp → update → store
-
-Iteration structure (Intel-tuned kernel):
-  A: load ─────┬─ z² ─┬─ t ─┬─ log1p ─┬─ exp ─┬─ update
-  B:      load ┴─ z² ─┴─ t ─┴─ log1p ─┴─ exp ─┴─ update
-              ↑
-         Interleaved: B's loads overlap A's compute
+  Advance: i += 8, idx_vec += 8
 ```
 
-**Impact:** Intel kernel achieves ~3% better throughput via tighter scheduling.
+### Optimized Horizontal Operations
+
+**Problem:** `vhaddpd` is slow (high latency, limited ports).
+
+**Solution:** Use `vunpckhpd + vaddsd`:
+```asm
+; Reduce [a, b, c, d] → a+b+c+d
+vextractf128 xmm0, ymm12, 1        ; [c, d]
+vaddpd       xmm0, xmm0, xmm12     ; [a+c, b+d]
+vunpckhpd    xmm1, xmm0, xmm0      ; [b+d, b+d]
+vaddsd       xmm0, xmm0, xmm1      ; a+b+c+d
+```
+
+### Truncation via BSR
+
+**Problem:** Chain of `bt` (bit test) instructions is slow.
+
+**Solution:** Single `bsr` (bit scan reverse) finds highest set bit:
+```asm
+vcmppd      ymm0, ymm_growth, ymm_thresh, 14
+vmovmskpd   eax, ymm0
+test        eax, eax
+jz          .skip
+bsr         ecx, eax              ; Find highest set bit
+lea         rbx, [rsi + rcx + 1]  ; last_valid = i + bit + 1
+```
 
 ### Running Index Vectors
 
-**Problem:** MAP tracking needs indices. Broadcasting loop counter is expensive:
-
+**Problem:** Broadcasting loop counter is expensive:
 ```c
 // Old: 2 µops, 3-cycle latency per iteration
 __m256i idx = _mm256_set1_epi64x(i);
 idx = _mm256_add_epi64(idx, offset_vec);
 ```
 
-**Solution:** Maintain running index vectors, increment by 8 each iteration:
-
+**Solution:** Maintain running index vectors:
 ```asm
 ; Setup (once):
-vmovapd  ymm_idx_a, [1.0, 2.0, 3.0, 4.0]
-vmovapd  ymm_idx_b, [5.0, 6.0, 7.0, 8.0]
+vmovapd  ymm15, [1.0, 2.0, 3.0, 4.0]   ; idx_vec_A
+vmovapd  ymm_b, [5.0, 6.0, 7.0, 8.0]   ; idx_vec_B (on stack)
 
-; Per iteration (1 µop, 1-cycle):
-vaddpd   ymm_idx_a, ymm_idx_a, [8.0, 8.0, 8.0, 8.0]
-vaddpd   ymm_idx_b, ymm_idx_b, [8.0, 8.0, 8.0, 8.0]
+; Per iteration (1 µop each):
+vaddpd   ymm15, ymm15, ymm7            ; ymm7 = [8,8,8,8]
+vaddpd   ymm3, [stack], ymm7
+vmovapd  [stack], ymm3
 ```
-
-**Impact:** +1-2% throughput.
-
-### Branchless MAX Tracking
-
-MAP run length requires finding argmax across all growth values:
-
-```asm
-vcmppd     ymm_mask, ymm_growth, ymm_max, 14    ; growth > max?
-vblendvpd  ymm_max, ymm_max, ymm_growth, ymm_mask
-vblendvpd  ymm_idx, ymm_idx, ymm_cur_idx, ymm_mask
-```
-
-No branches, no mispredictions. Final horizontal reduction only at loop end.
 
 ### Precomputed Student-t Constants
 
@@ -269,59 +308,53 @@ Hot path: 1 multiply, 1 FMA, 1 log1p. No lgamma, no division.
 
 ## Assembly Kernel Architecture
 
-Two hand-written AVX2 kernels optimize for different microarchitectures:
-
-### Generic Kernel (`bocpd_kernel_avx2_generic.asm`)
-
-- **Target:** All x86-64 with AVX2+FMA (AMD Zen1-4, Intel Haswell+)
-- **Strategy:** Conservative scheduling, sequential A-then-B blocks
-- **Throughput:** ~510K obs/sec
-- **Use when:** AMD CPUs, unknown target, maximum compatibility
-
-### Intel-Tuned Kernel (`bocpd_kernel_avx2_intel.asm`)
-
-- **Target:** Intel Golden Cove / Raptor Cove (12th-14th gen)
-- **Strategy:** Aggressive ILP, interleaved A/B scheduling
-- **Throughput:** ~525K obs/sec (+3%)
-- **Use when:** Intel Alder Lake, Raptor Lake, or newer
+Hand-written AVX2 kernel optimized for modern x86-64:
 
 ### Register Allocation (AVX2: 16 YMM registers)
-
 ```
-Preserved (never spilled):
-  ymm15 = x (observation, broadcast)
-  ymm14 = h (hazard rate)
-  ymm13 = 1-h
-  ymm12 = threshold
-  ymm11 = r0 accumulator
-  ymm10 = max_growth_A
-  ymm9  = max_growth_B
+Dedicated constants:
+  ymm6  = const_one (1.0)
+  ymm7  = idx_increment (8.0)
+  ymm8  = x (observation, broadcast)
+  ymm9  = h (hazard rate)
+  ymm10 = 1-h
+  ymm11 = threshold
 
-Scratch (reused per iteration):
-  ymm0-8 = computation temporaries
+Accumulators:
+  ymm12 = r0 accumulator
+  ymm13 = max_growth_A
+  ymm14 = max_growth_B
+  ymm15 = idx_vec_A
 
-Stack spills:
-  idx_vec_A, idx_vec_B (running indices)
-  max_idx_A, max_idx_B (argmax tracking)
+Scratch (reused per block):
+  ymm0-5 = computation temporaries
+
+Stack storage:
+  idx_vec_B, max_idx_A, max_idx_B
 ```
 
-All polynomial constants loaded from L1 cache (fast on modern CPUs, avoids register pressure).
+### Block Addressing (V3 Layout)
+```asm
+; Block A: elements [i, i+1, i+2, i+3]
+mov     rax, rsi
+shr     rax, 2          ; block_index = i / 4
+shl     rax, 8          ; byte_offset = block_index * 256
+
+vmovapd ymm0, [r8 + rax]        ; mu at offset 0
+vmovapd ymm1, [r8 + rax + 32]   ; C1 at offset 32
+vmovapd ymm2, [r8 + rax + 64]   ; C2 at offset 64
+vmovapd ymm3, [r8 + rax + 96]   ; inv_ssn at offset 96
+
+; Block B: elements [i+4, i+5, i+6, i+7]
+mov     rax, rsi
+add     rax, 4
+shr     rax, 2
+shl     rax, 8          ; Next block at +256 bytes
+```
 
 ---
 
 ## Configuration
-
-### Kernel Selection
-
-```c
-// bocpd_config.h
-
-#define BOCPD_KERNEL_GENERIC      0   // Safe default
-#define BOCPD_KERNEL_INTEL_PERF   1   // Intel 12th-14th gen
-
-// Set at compile time:
-// gcc -DBOCPD_USE_ASM=1 -DBOCPD_KERNEL_VARIANT=1 ...
-```
 
 ### Prior Parameters
 
@@ -352,43 +385,43 @@ bocpd_prior_t prior = {
 
 ---
 
-## Integration Examples
+## Quick Start
 
-### Adaptive Position Sizing
-
+### Single Detector
 ```c
-double position_size(double signal, bocpd_t *cpd, double base, double vol) {
-    double p_change = bocpd_change_prob(cpd, 5);
-    double regime_scale = 1.0 - 0.7 * p_change;  // 30-100%
-    double vol_scale = 0.02 / vol;
-    return base * signal * regime_scale * vol_scale;
+#include "bocpd_asm.h"
+
+bocpd_asm_t detector;
+bocpd_prior_t prior = {0.0, 1.0, 1.0, 1.0};
+
+bocpd_ultra_init(&detector, 200.0, prior, 1024);
+
+for (int i = 0; i < n_observations; i++) {
+    bocpd_ultra_step(&detector, data[i]);
+    
+    if (detector.p_changepoint > 0.5) {
+        printf("Changepoint detected at t=%zu\n", detector.t);
+    }
 }
+
+bocpd_ultra_free(&detector);
 ```
 
-### Kalman Filter Q Scaling
-
+### Pool of Detectors
 ```c
-void process(double x, bocpd_t *cpd, kalman_t *kf) {
-    bocpd_step(cpd, x);
-    double p = bocpd_change_prob(cpd, 5);
-    kalman_set_q_scale(kf, 1.0 + 5.0 * p);  // 1× to 6×
-    kalman_update(kf, x);
+bocpd_pool_t pool;
+bocpd_prior_t prior = {0.0, 1.0, 1.0, 1.0};
+
+bocpd_pool_init(&pool, 100, 200.0, prior, 1024);
+
+for (int t = 0; t < n_steps; t++) {
+    for (int i = 0; i < 100; i++) {
+        bocpd_ultra_step(&pool.detectors[i], data[i][t]);
+    }
 }
+
+bocpd_pool_free(&pool);
 ```
-
-### Multi-Instrument
-
-```c
-bocpd_t cpd[N_INSTRUMENTS];
-
-void on_tick(int id, double ret) {
-    bocpd_step(&cpd[id], ret);
-    if (bocpd_change_prob(&cpd[id], 5) > 0.3)
-        flag_regime_change(id);
-}
-```
-
-Each `bocpd_t` instance is independent — trivially parallelizable across threads.
 
 ---
 
@@ -396,8 +429,8 @@ Each `bocpd_t` instance is independent — trivially parallelizable across threa
 
 | Capacity | Memory | Notes |
 |----------|--------|-------|
-| 128 | ~19 KB | Minimum practical |
-| 256 | ~37 KB | Low-latency trading |
+| 64 | ~18 KB | Minimum practical |
+| 256 | ~38 KB | Low-latency trading |
 | 512 | ~74 KB | General use |
 | 1024 | ~148 KB | Long regimes |
 | 2048 | ~296 KB | Extended analysis |
@@ -406,30 +439,23 @@ Each `bocpd_t` instance is independent — trivially parallelizable across threa
 
 ## Design Philosophy: Why Not Faster?
 
-This implementation achieves ~525K obs/sec. Faster is possible — but not without sacrificing correctness. Every decision below chose **accuracy over speed** where they conflicted.
+This implementation achieves **3.01M obs/sec peak**. Faster is possible — but not without sacrificing correctness.
 
 ### What We Refused To Do
 
-| # | Rejected Optimization | Speedup | Why We Refused |
-|---|----------------------|---------|----------------|
-| 1 | **Low-order polynomials** (4th-order exp, Schraudolph bit-hack, fp32 intermediates) | +7-15% | Tail probabilities span 300+ orders of magnitude. Approximation errors compound across thousands of updates |
-| 2 | **Approximate pruning** (top-K, survival decay, half-bin, skip tiny run lengths) | +30-70% | Makes posterior non-normalizable and non-Bayesian. We use only principled threshold truncation |
-| 3 | **Block-level truncation** (one threshold check per 8-wide SIMD block) | +1-2% | Mis-handles regime shift boundaries. Per-lane truncation is safer |
-| 4 | **float16/float32 compression** (parameters or run-length distribution) | +10-20% | fp32 underflows at ~1e-38. Run-length probabilities routinely hit 1e-200 |
-| 5 | **Fused exp(log1p())** (single polynomial for entire expression) | +5-10% | Accuracy dies for large z²/σ². Causes drift and false changepoint detections |
-| 6 | **Bit-hack exponentiation** (ML accelerator tricks) | +15-25% | Numerically unsafe for BOCPD input ranges (ln_pp can hit -700) |
-| 7 | **Top-1 path tracking** (only track MAP run-length) | +3000-5000% | Not Bayesian. Cannot quantify uncertainty. Useless for VaR/portfolio risk |
-| 8 | **Cross-update caching** (reuse partial computations between observations) | +5-10% | Violates independence assumptions. Introduces sequence-specific drift |
-| 9 | **Unstable reductions** (fp32 sums, Kahan removal, in-loop horizontal ops) | +2-5% | r0 accumulator sees 256+ additions/step. Errors compound to large bias |
-| 10 | **Hard underflow clamp** (`if (pp < 1e-12) pp = 0`) | +1% | Creates discontinuities. We clamp at 1e-300 — effectively zero but continuous |
-| 11 | **Approximate lgamma** (Stirling's approximation) | +3-5% | Drifts over long sequences. We use exact recurrence relation |
-| 12 | **In-loop horizontal SIMD** (reduce across lanes every iteration) | +0% (actually slower) | We accumulate vertically, reduce once at loop end |
+| Rejected Optimization | Potential Gain | Why We Refused |
+|----------------------|----------------|----------------|
+| Low-order polynomials | +7-15% | Tail probabilities span 300+ orders of magnitude |
+| Approximate pruning (top-K) | +30-70% | Makes posterior non-Bayesian |
+| float16/float32 | +10-20% | Underflows at ~1e-38; run-lengths hit 1e-200 |
+| Top-1 path tracking | +3000% | Not Bayesian, can't quantify uncertainty |
+| Bit-hack exponentiation | +15-25% | Numerically unsafe for BOCPD ranges |
 
 ### The Bottom Line
 
-Anyone claiming 2M+ obs/sec for "BOCPD" is likely doing #7 (top-1 path tracking) or #1 (garbage polynomials). That's not Bayesian inference — it's a fast heuristic wearing Bayesian clothing.
+Anyone claiming 10M+ obs/sec for "BOCPD" is likely doing top-1 path tracking or using garbage polynomials. That's not Bayesian inference.
 
-**~525K obs/sec is the performance ceiling given these constraints.** For trading systems where wrong signals cost real money, that ceiling is the right place to be.
+**3M obs/sec is the performance ceiling given numerical constraints.** For trading systems where wrong signals cost real money, that ceiling is the right place to be.
 
 ---
 
@@ -445,13 +471,13 @@ Anyone claiming 2M+ obs/sec for "BOCPD" is likely doing #7 (top-1 path tracking)
 
 ---
 
-## Future Work
+## Version History
 
-- [ ] AVX-512 kernel (512-bit vectors, 32 YMM registers)
-- [ ] ARM NEON port
-- [ ] Multi-variate extension
-- [ ] Python bindings
-- [ ] GPU (CUDA) implementation
+| Version | Throughput | Key Changes |
+|---------|------------|-------------|
+| V1 (Naive) | 52K obs/sec | Reference implementation |
+| V2 | 525K obs/sec | Ping-pong buffers, AVX2 kernel |
+| **V3.1** | **3.01M obs/sec** | Native interleaved layout, optimized ASM |
 
 ---
 
@@ -461,4 +487,4 @@ MIT License. See [LICENSE](LICENSE).
 
 ---
 
-*Built for speed. Designed for trading. Open for all*
+*Built for speed. Designed for trading. Open for all.*
