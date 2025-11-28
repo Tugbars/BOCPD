@@ -1031,13 +1031,23 @@ void bocpd_ultra_free(bocpd_asm_t *b)
 
 void bocpd_ultra_reset(bocpd_asm_t *b)
 {
-    if (!b)
-        return;
-
+    if (!b) return;
+    
+    /* Clear run-length distribution */
     memset(b->r, 0, (b->capacity + 32) * sizeof(double));
+    memset(b->r_scratch, 0, (b->capacity + 32) * sizeof(double));
+    
+    /* Clear interleaved buffers */
+    size_t n_blocks = b->capacity / 4 + 2;
+    size_t bytes_interleaved = n_blocks * BOCPD_IBLK_STRIDE;
+    memset(b->interleaved[0], 0, bytes_interleaved);
+    memset(b->interleaved[1], 0, bytes_interleaved);
+    
     b->t = 0;
     b->active_len = 0;
     b->cur_buf = 0;
+    b->map_runlength = 0;
+    b->p_changepoint = 0.0;
 }
 
 void bocpd_ultra_step(bocpd_asm_t *b, double x)

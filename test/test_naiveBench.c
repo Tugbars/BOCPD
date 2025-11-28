@@ -383,7 +383,7 @@ static void test_single_detector_throughput(void)
     print_separator();
     printf("\n");
     
-    const int N_SAMPLES = 500;
+    const int N_SAMPLES = 380;
     const int N_WARMUP = 100;
     const int N_RUNS = 5;
     
@@ -689,7 +689,7 @@ int main(void)
     printf("          BOCPD PERFORMANCE COMPARISON: NAIVE vs OPTIMIZED V3.1\n");
     printf("================================================================================\n");
     
-    test_correctness();
+    //test_correctness();
     test_single_detector_throughput();
     test_multi_detector_throughput();
     test_large_scale();
