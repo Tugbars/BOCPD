@@ -25,58 +25,61 @@
 ; VERDICT: The performance gain is minimal (~1-2%). Use this only if you
 ; need every last cycle. The struct-pointer version is easier to maintain.
 ;
-; =============================================================================
-; CALLING CONVENTION
-; =============================================================================
+; ============================================================================
+; CALLING CONVENTION (CORRECTED)
+; ============================================================================
 ;
-; This file provides TWO entry points:
+; IMPORTANT: Windows x64 only passes first 4 args in registers!
+; Arguments 5+ always go on the stack, regardless of type.
+; So we put the 4 floats FIRST to get them in XMM registers.
 ;
 ; WINDOWS x64 (bocpd_fast_avx2_win):
-;   RCX = params (interleaved superblocks pointer)
-;   RDX = r_old (input probability array)
-;   R8  = r_new (output probability array)  
-;   R9  = n_padded (number of elements, padded to 8)
-;   XMM0 = x (observation)
-;   XMM1 = h (hazard rate)
-;   XMM2 = one_minus_h (1 - h)
-;   XMM3 = threshold (truncation threshold)
-;   Stack [RSP+40] = r0_out (pointer to output r0)
-;   Stack [RSP+48] = max_growth_out (pointer to output max growth)
-;   Stack [RSP+56] = max_idx_out (pointer to output max index)
-;   Stack [RSP+64] = last_valid_out (pointer to output last valid)
+;   XMM0 = x (observation)           [arg1]
+;   XMM1 = h (hazard rate)           [arg2]
+;   XMM2 = one_minus_h               [arg3]
+;   XMM3 = threshold                 [arg4]
+;   Stack [RSP+40] = params          [arg5]
+;   Stack [RSP+48] = r_old           [arg6]
+;   Stack [RSP+56] = r_new           [arg7]
+;   Stack [RSP+64] = n_padded        [arg8]
+;   Stack [RSP+72] = r0_out          [arg9]
+;   Stack [RSP+80] = max_growth_out  [arg10]
+;   Stack [RSP+88] = max_idx_out     [arg11]
+;   Stack [RSP+96] = last_valid_out  [arg12]
 ;
 ; LINUX/MACOS System V (bocpd_fast_avx2_sysv):
-;   RDI = params
-;   RSI = r_old
-;   RDX = r_new
-;   RCX = n_padded
-;   XMM0 = x
-;   XMM1 = h
-;   XMM2 = one_minus_h
-;   XMM3 = threshold
-;   R8  = r0_out
-;   R9  = max_growth_out
-;   Stack [RSP+8]  = max_idx_out
-;   Stack [RSP+16] = last_valid_out
+;   XMM0 = x                         [float arg1]
+;   XMM1 = h                         [float arg2]
+;   XMM2 = one_minus_h               [float arg3]
+;   XMM3 = threshold                 [float arg4]
+;   RDI = params                     [int arg1]
+;   RSI = r_old                      [int arg2]
+;   RDX = r_new                      [int arg3]
+;   RCX = n_padded                   [int arg4]
+;   R8  = r0_out                     [int arg5]
+;   R9  = max_growth_out             [int arg6]
+;   Stack [RSP+8]  = max_idx_out     [int arg7]
+;   Stack [RSP+16] = last_valid_out  [int arg8]
 ;
 ; =============================================================================
-; C WRAPPER EXAMPLE (Windows)
+; C FUNCTION SIGNATURE (both platforms)
 ; =============================================================================
 ;
-; extern void bocpd_fast_avx2_win(
-;     const double *params,      // RCX
-;     const double *r_old,       // RDX  
-;     double *r_new,             // R8
-;     size_t n_padded,           // R9
-;     double x,                  // XMM0
-;     double h,                  // XMM1
-;     double one_minus_h,        // XMM2
-;     double threshold,          // XMM3
-;     double *r0_out,            // Stack
-;     double *max_growth_out,    // Stack
-;     size_t *max_idx_out,       // Stack
-;     size_t *last_valid_out     // Stack
+; void bocpd_fast_avx2(
+;     double x,                  // Arg 1 - XMM0 (Win) / XMM0 (SysV)
+;     double h,                  // Arg 2 - XMM1 (Win) / XMM1 (SysV)
+;     double one_minus_h,        // Arg 3 - XMM2 (Win) / XMM2 (SysV)
+;     double threshold,          // Arg 4 - XMM3 (Win) / XMM3 (SysV)
+;     const double *params,      // Arg 5 - Stack (Win) / RDI (SysV)
+;     const double *r_old,       // Arg 6 - Stack (Win) / RSI (SysV)
+;     double *r_new,             // Arg 7 - Stack (Win) / RDX (SysV)
+;     size_t n_padded,           // Arg 8 - Stack (Win) / RCX (SysV)
+;     double *r0_out,            // Arg 9 - Stack (Win) / R8 (SysV)
+;     double *max_growth_out,    // Arg 10 - Stack (Win) / R9 (SysV)
+;     size_t *max_idx_out,       // Arg 11 - Stack (Win) / Stack (SysV)
+;     size_t *last_valid_out     // Arg 12 - Stack (Win) / Stack (SysV)
 ; );
+;
 ;
 ; =============================================================================
 ; REGISTER ALLOCATION (during main loop)
@@ -235,32 +238,41 @@ bocpd_fast_avx2_win:
     ; -----------------------------------------------------------------------
     ; UNPACK WINDOWS ARGUMENTS
     ; -----------------------------------------------------------------------
-    ; Register args: RCX=params, RDX=r_old, R8=r_new, R9=n_padded
-    ; XMM args: XMM0=x, XMM1=h, XMM2=one_minus_h, XMM3=threshold
-    ; Stack args (relative to RBP before our allocations):
-    ;   [RBP + 160 + 64 + 40] = r0_out
-    ;   [RBP + 160 + 64 + 48] = max_growth_out  
-    ;   [RBP + 160 + 64 + 56] = max_idx_out
-    ;   [RBP + 160 + 64 + 64] = last_valid_out
-    ; (160 = XMM saves, 64 = GPR pushes)
+    ; Floats in XMM0-3 (already there from caller):
+    ;   XMM0 = x, XMM1 = h, XMM2 = one_minus_h, XMM3 = threshold
+    ;
+    ; All pointers and integers on stack (after return addr + shadow):
+    ;   [rbp + 224 + 40] = params          (arg5)
+    ;   [rbp + 224 + 48] = r_old           (arg6)
+    ;   [rbp + 224 + 56] = r_new           (arg7)
+    ;   [rbp + 224 + 64] = n_padded        (arg8)
+    ;   [rbp + 224 + 72] = r0_out          (arg9)
+    ;   [rbp + 224 + 80] = max_growth_out  (arg10)
+    ;   [rbp + 224 + 88] = max_idx_out     (arg11)
+    ;   [rbp + 224 + 96] = last_valid_out  (arg12)
+    ; Where 224 = 160 (XMM saves) + 64 (GPR pushes)
 
-    mov     r13, rcx                    ; r13 = params (preserved)
-    mov     [rsp + STK_R_OLD_PTR], rdx  ; save r_old pointer
-    mov     [rsp + STK_R_NEW_PTR], r8   ; save r_new pointer
-    mov     r12, r9                     ; r12 = n_padded (preserved)
-
-    ; Load stack arguments (account for pushes + XMM saves)
-    %define WIN_STACK_OFFSET (160 + 64 + 32)  ; XMM + GPR + shadow space
-    mov     rax, [rbp + WIN_STACK_OFFSET + 8]
+    %define WIN_STACK_BASE (160 + 64 + 40)  ; XMM + GPR + ret + shadow
+    
+    ; Load pointer arguments from stack
+    mov     r13, [rbp + WIN_STACK_BASE + 0]     ; r13 = params
+    mov     rax, [rbp + WIN_STACK_BASE + 8]     ; r_old
+    mov     [rsp + STK_R_OLD_PTR], rax
+    mov     rax, [rbp + WIN_STACK_BASE + 16]    ; r_new
+    mov     [rsp + STK_R_NEW_PTR], rax
+    mov     r12, [rbp + WIN_STACK_BASE + 24]    ; r12 = n_padded
+    
+    ; Load output pointers
+    mov     rax, [rbp + WIN_STACK_BASE + 32]
     mov     [rsp + STK_R0_OUT], rax
-    mov     rax, [rbp + WIN_STACK_OFFSET + 16]
+    mov     rax, [rbp + WIN_STACK_BASE + 40]
     mov     [rsp + STK_MAX_GROWTH_OUT], rax
-    mov     rax, [rbp + WIN_STACK_OFFSET + 24]
+    mov     rax, [rbp + WIN_STACK_BASE + 48]
     mov     [rsp + STK_MAX_IDX_OUT], rax
-    mov     rax, [rbp + WIN_STACK_OFFSET + 32]
+    mov     rax, [rbp + WIN_STACK_BASE + 56]
     mov     [rsp + STK_LAST_VALID_OUT], rax
 
-    ; Broadcast scalar parameters to YMM registers
+    ; Broadcast scalar parameters from XMM to YMM registers
     vbroadcastsd ymm15, xmm0            ; x
     vbroadcastsd ymm14, xmm1            ; h
     vbroadcastsd ymm13, xmm2            ; 1-h
@@ -694,10 +706,13 @@ bocpd_fast_avx2_sysv:
 
     ; -----------------------------------------------------------------------
     ; UNPACK SYSTEM V ARGUMENTS
-    ; RDI=params, RSI=r_old, RDX=r_new, RCX=n_padded
-    ; R8=r0_out, R9=max_growth_out
-    ; XMM0=x, XMM1=h, XMM2=one_minus_h, XMM3=threshold
-    ; Stack: [RBP+56]=max_idx_out, [RBP+64]=last_valid_out
+    ; -----------------------------------------------------------------------
+    ; System V ABI counts floats and integers separately:
+    ;   Float args:   XMM0=x, XMM1=h, XMM2=one_minus_h, XMM3=threshold
+    ;   Integer args: RDI=params, RSI=r_old, RDX=r_new, RCX=n_padded,
+    ;                 R8=r0_out, R9=max_growth_out
+    ;   Stack args:   [RBP+56]=max_idx_out, [RBP+64]=last_valid_out
+    ; (Stack offsets: 6 GPR pushes × 8 bytes = 48, plus 8 for ret addr = 56)
     ; -----------------------------------------------------------------------
     mov     r13, rdi
     mov     [rsp + STK_R_OLD_PTR], rsi
