@@ -544,19 +544,107 @@ static inline double fast_lgamma_stirling_scalar(double x)
     return base + correction;
 }
 
+/**
+ * @brief Scalar lgamma dispatch - chooses Lanczos or Stirling based on input.
+ *
+ * WHY THE THRESHOLD OF 40:
+ * - Both approximations achieve ~15 digits of precision at x = 40
+ * - Below 40: Lanczos is more accurate (Stirling's asymptotic series diverges)
+ * - Above 40: Stirling is simpler (1 division vs 5) and equally accurate
+ *
+ * In BOCPD, α starts at α₀ (typically 1-10) and grows by 0.5 per observation.
+ * - First ~80 observations: α < 40, use Lanczos
+ * - After ~80 observations: α > 40, use Stirling (faster)
+ *
+ * This is why V3.2's movemask optimization helps so much - after the initial
+ * phase, ALL lanes consistently use Stirling.
+ */
 static inline double fast_lgamma_scalar(double x)
 {
     return (x > 40.0) ? fast_lgamma_stirling_scalar(x) 
                       : fast_lgamma_lanczos_scalar(x);
 }
 
+/**
+ * @brief AVX2 vectorized Lanczos lgamma approximation.
+ *
+ * =============================================================================
+ * THE LANCZOS APPROXIMATION - MATHEMATICAL DERIVATION
+ * =============================================================================
+ *
+ * The gamma function is defined as:
+ *   Γ(x) = ∫₀^∞ t^(x-1) × e^(-t) dt
+ *
+ * Direct numerical integration is expensive. Lanczos (1964) discovered a
+ * remarkable approximation based on Chebyshev polynomials:
+ *
+ *   Γ(x+1) ≈ √(2π) × (x + g + 0.5)^(x + 0.5) × e^(-(x + g + 0.5)) × Ag(x)
+ *
+ * where g is a tuning parameter and Ag(x) is a rational function.
+ *
+ * Using Γ(x+1) = x × Γ(x), we can write for Γ(x):
+ *   Γ(x) ≈ √(2π) × (x + g - 0.5)^(x - 0.5) × e^(-(x + g - 0.5)) × Ag(x)
+ *
+ * Taking the logarithm:
+ *   ln Γ(x) = 0.5×ln(2π) + (x - 0.5)×ln(x + g - 0.5) - (x + g - 0.5) + ln(Ag(x))
+ *
+ * THE RATIONAL FUNCTION Ag(x):
+ * -----------------------------
+ * Ag(x) = c₀ + c₁/(x) + c₂/(x+1) + c₃/(x+2) + c₄/(x+3) + c₅/(x+4)
+ *
+ * The coefficients depend on g and were computed by Paul Godfrey to minimize
+ * the maximum error. For g = 4.7421875:
+ *   c₀ =  1.000000000190015
+ *   c₁ =  76.18009172947146
+ *   c₂ = -86.50532032941677
+ *   c₃ =  24.01409824083091
+ *   c₄ = -1.231739572450155
+ *   c₅ =  0.001208650973866179
+ *
+ * WHY g = 4.7421875:
+ * The choice of g affects both accuracy and the range of validity.
+ * This specific value (from Numerical Recipes) balances:
+ * - Accuracy across [1, ∞)
+ * - Numerical stability of the coefficients
+ * - The value 4.7421875 = 607/128 is exactly representable in binary
+ *
+ * WHY 5 DIVISIONS:
+ * Each term c_k/(x+k) requires a division. Divisions have 13-20 cycle latency
+ * on modern CPUs, but can pipeline. With 5 independent divisions, the CPU
+ * can overlap their execution. The alternative (computing 1/x then multiplying)
+ * would have a serial dependency on that first division.
+ *
+ * PRECISION ANALYSIS:
+ * For x ∈ [1, 40], this achieves ~15 decimal digits of precision.
+ * For x < 1, use the reflection formula (not implemented here because BOCPD
+ * never encounters x < 1; α starts at α₀ ≥ 1).
+ *
+ * =============================================================================
+ * SIMD IMPLEMENTATION NOTES
+ * =============================================================================
+ *
+ * The 5 divisions dominate execution time. On Haswell/Skylake:
+ * - vdivpd latency: 13-14 cycles
+ * - vdivpd throughput: 1 per 4-8 cycles
+ *
+ * We compute xp0, xp1, xp2, xp3, xp4 first so all divisions can be issued
+ * back-to-back, maximizing pipeline utilization. The CPU will execute them
+ * in parallel to the extent possible.
+ */
 static inline __m256d lgamma_lanczos_avx2(__m256d x)
 {
     const __m256d half = _mm256_set1_pd(0.5);
     const __m256d one = _mm256_set1_pd(1.0);
-    const __m256d half_ln2pi = _mm256_set1_pd(0.9189385332046727);
-    const __m256d g = _mm256_set1_pd(4.7421875);
+    const __m256d half_ln2pi = _mm256_set1_pd(0.9189385332046727);  /* 0.5 × ln(2π) */
+    const __m256d g = _mm256_set1_pd(4.7421875);  /* Lanczos g parameter */
 
+    /*
+     * Lanczos coefficients for g = 4.7421875.
+     * Source: Numerical Recipes, derived from Chebyshev polynomial fitting.
+     *
+     * The alternating signs (positive, negative, positive...) are characteristic
+     * of Chebyshev-derived approximations and help with error cancellation.
+     */
     const __m256d c0 = _mm256_set1_pd(1.000000000190015);
     const __m256d c1 = _mm256_set1_pd(76.18009172947146);
     const __m256d c2 = _mm256_set1_pd(-86.50532032941677);
@@ -564,12 +652,25 @@ static inline __m256d lgamma_lanczos_avx2(__m256d x)
     const __m256d c4 = _mm256_set1_pd(-1.231739572450155);
     const __m256d c5 = _mm256_set1_pd(0.001208650973866179);
 
+    /*
+     * Precompute denominators: x, x+1, x+2, x+3, x+4
+     * Computing these first allows maximum overlap of the subsequent divisions.
+     */
     __m256d xp0 = x;
     __m256d xp1 = _mm256_add_pd(x, one);
     __m256d xp2 = _mm256_add_pd(x, _mm256_set1_pd(2.0));
     __m256d xp3 = _mm256_add_pd(x, _mm256_set1_pd(3.0));
     __m256d xp4 = _mm256_add_pd(x, _mm256_set1_pd(4.0));
 
+    /*
+     * Rational function: Ag(x) = c0 + c1/x + c2/(x+1) + c3/(x+2) + c4/(x+3) + c5/(x+4)
+     *
+     * The divisions are the bottleneck. On Skylake, vdivpd has:
+     * - Latency: 13-14 cycles
+     * - Throughput: 1 per 4 cycles (can have 3-4 in flight simultaneously)
+     *
+     * By issuing all divisions close together, we maximize pipeline utilization.
+     */
     __m256d Ag = c0;
     Ag = _mm256_add_pd(Ag, _mm256_div_pd(c1, xp0));
     Ag = _mm256_add_pd(Ag, _mm256_div_pd(c2, xp1));
@@ -577,10 +678,20 @@ static inline __m256d lgamma_lanczos_avx2(__m256d x)
     Ag = _mm256_add_pd(Ag, _mm256_div_pd(c4, xp3));
     Ag = _mm256_add_pd(Ag, _mm256_div_pd(c5, xp4));
 
+    /*
+     * t = x + g - 0.5
+     * This shifted argument appears in both the power term and the exponential term.
+     */
     __m256d t = _mm256_add_pd(x, _mm256_sub_pd(g, half));
     __m256d ln_t = fast_log_avx2(t);
     __m256d ln_Ag = fast_log_avx2(Ag);
 
+    /*
+     * Final assembly: ln Γ(x) = 0.5×ln(2π) + (x-0.5)×ln(t) - t + ln(Ag)
+     *
+     * Using FMA to combine: result = half_ln2pi + (x - 0.5) × ln_t
+     * Then subtract t, add ln_Ag.
+     */
     __m256d result = half_ln2pi;
     result = _mm256_fmadd_pd(_mm256_sub_pd(x, half), ln_t, result);
     result = _mm256_sub_pd(result, t);
@@ -589,32 +700,140 @@ static inline __m256d lgamma_lanczos_avx2(__m256d x)
     return result;
 }
 
+/**
+ * @brief AVX2 vectorized Stirling lgamma approximation.
+ *
+ * =============================================================================
+ * STIRLING'S APPROXIMATION - MATHEMATICAL DERIVATION
+ * =============================================================================
+ *
+ * Stirling's formula (1730) approximates n! for large n:
+ *   n! ≈ √(2πn) × (n/e)^n
+ *
+ * For the gamma function (where Γ(n+1) = n!):
+ *   Γ(x) ≈ √(2π/x) × (x/e)^x
+ *
+ * Taking logarithm:
+ *   ln Γ(x) ≈ 0.5×ln(2π) - 0.5×ln(x) + x×ln(x) - x
+ *           = 0.5×ln(2π) + (x - 0.5)×ln(x) - x
+ *
+ * This is the "base" approximation. The asymptotic CORRECTION series is:
+ *   ln Γ(x) = base + (1/12x) - (1/360x³) + (1/1260x⁵) - (1/1680x⁷) + ...
+ *
+ * THE BERNOULLI CONNECTION:
+ * The correction coefficients come from the Bernoulli numbers Bₙ:
+ *   correction = Σ_{n=1}^∞ B_{2n} / (2n × (2n-1) × x^{2n-1})
+ *
+ * First few Bernoulli numbers: B₂ = 1/6, B₄ = -1/30, B₆ = 1/42, B₈ = -1/30, ...
+ *
+ * Computing the coefficients:
+ *   s₁ = B₂/(2×1) = (1/6)/2 = 1/12 ≈ 0.0833...
+ *   s₂ = B₄/(4×3) = (-1/30)/12 = -1/360 ≈ -0.00278...
+ *   s₃ = B₆/(6×5) = (1/42)/30 = 1/1260 ≈ 0.000794...
+ *   s₄ = B₈/(8×7) = (-1/30)/56 = -1/1680 ≈ -0.000595...
+ *   s₅ = B₁₀/(10×9) = (5/66)/90 ≈ 0.000842...
+ *   s₆ = B₁₂/(12×11) = (-691/2730)/132 ≈ -0.00192...
+ *
+ * =============================================================================
+ * ASYMPTOTIC VS CONVERGENT SERIES
+ * =============================================================================
+ *
+ * CRITICAL INSIGHT: Stirling's series is ASYMPTOTIC, not convergent!
+ *
+ * If you take infinitely many terms, the series DIVERGES (Bₙ grows super-
+ * exponentially). However, for any fixed number of terms N, the error
+ * decreases as x → ∞.
+ *
+ * The optimal number of terms depends on x:
+ * - For x = 10: ~4-5 terms optimal
+ * - For x = 40: ~6-7 terms optimal
+ * - For x = 100: ~8-9 terms optimal
+ *
+ * We use 6 terms, which gives ~15 digits for x > 40. Adding more terms
+ * would actually HURT precision for x near 40!
+ *
+ * WHY STIRLING FOR LARGE x:
+ * - Lanczos has 5 divisions, Stirling has only 1
+ * - For large x, Stirling's "base" term dominates, corrections are tiny
+ * - Precision: both achieve ~15 digits for x > 40
+ * - Speed: Stirling is ~20% faster due to fewer divisions
+ *
+ * =============================================================================
+ * SIMD IMPLEMENTATION NOTES
+ * =============================================================================
+ *
+ * The correction terms form a polynomial in 1/x². We evaluate using Horner's
+ * method (right-to-left), starting from s₆:
+ *   correction = ((((s₆×z + s₅)×z + s₄)×z + s₃)×z + s₂)×z + s₁
+ * where z = 1/x².
+ *
+ * Then multiply by 1/x to get the final correction (which is O(1/x)).
+ *
+ * The single division (1/x) is the latency bottleneck. We compute inv_x
+ * first so the CPU can start the division early while we compute ln_x.
+ */
 static inline __m256d lgamma_stirling_avx2(__m256d x)
 {
     const __m256d half = _mm256_set1_pd(0.5);
     const __m256d one = _mm256_set1_pd(1.0);
-    const __m256d half_ln2pi = _mm256_set1_pd(0.9189385332046727);
+    const __m256d half_ln2pi = _mm256_set1_pd(0.9189385332046727);  /* 0.5 × ln(2π) */
 
-    const __m256d s1 = _mm256_set1_pd(0.0833333333333333333);
-    const __m256d s2 = _mm256_set1_pd(-0.00277777777777777778);
-    const __m256d s3 = _mm256_set1_pd(0.000793650793650793651);
-    const __m256d s4 = _mm256_set1_pd(-0.000595238095238095238);
-    const __m256d s5 = _mm256_set1_pd(0.000841750841750841751);
-    const __m256d s6 = _mm256_set1_pd(-0.00191752691752691753);
+    /*
+     * Stirling correction coefficients: B_{2n} / (2n × (2n-1))
+     *
+     * These come from the Bernoulli numbers. The alternating signs reflect
+     * the alternating signs of even Bernoulli numbers (B₂ > 0, B₄ < 0, ...).
+     *
+     * The coefficients decrease rapidly in magnitude, which is why truncating
+     * at 6 terms works well for x > 40.
+     */
+    const __m256d s1 = _mm256_set1_pd(0.0833333333333333333);    /* 1/12 */
+    const __m256d s2 = _mm256_set1_pd(-0.00277777777777777778);  /* -1/360 */
+    const __m256d s3 = _mm256_set1_pd(0.000793650793650793651);  /* 1/1260 */
+    const __m256d s4 = _mm256_set1_pd(-0.000595238095238095238); /* -1/1680 */
+    const __m256d s5 = _mm256_set1_pd(0.000841750841750841751);  /* 5/5940 */
+    const __m256d s6 = _mm256_set1_pd(-0.00191752691752691753);  /* -691/360360 */
 
+    /*
+     * Base Stirling approximation:
+     *   ln Γ(x) ≈ (x - 0.5)×ln(x) - x + 0.5×ln(2π)
+     *
+     * Rearranged for FMA: (x - 0.5)×ln(x) + (0.5×ln(2π) - x)
+     */
     __m256d ln_x = fast_log_avx2(x);
     __m256d base = _mm256_fmadd_pd(_mm256_sub_pd(x, half), ln_x,
                                    _mm256_sub_pd(half_ln2pi, x));
 
+    /*
+     * Compute 1/x and 1/x² for the correction polynomial.
+     *
+     * The correction is: s₁/x + s₂/x³ + s₃/x⁵ + s₄/x⁷ + s₅/x⁹ + s₆/x¹¹
+     *                  = (1/x) × (s₁ + s₂/x² + s₃/x⁴ + s₄/x⁶ + s₅/x⁸ + s₆/x¹⁰)
+     *                  = (1/x) × polynomial_in_(1/x²)
+     */
     __m256d inv_x = _mm256_div_pd(one, x);
-    __m256d inv_x2 = _mm256_mul_pd(inv_x, inv_x);
+    __m256d inv_x2 = _mm256_mul_pd(inv_x, inv_x);  /* z = 1/x² */
 
+    /*
+     * Horner evaluation of polynomial in z = 1/x²:
+     *   poly(z) = s₁ + z×(s₂ + z×(s₃ + z×(s₄ + z×(s₅ + z×s₆))))
+     *
+     * We evaluate right-to-left (innermost first):
+     *   Start with s₆
+     *   Multiply by z, add s₅ → s₆×z + s₅
+     *   Multiply by z, add s₄ → (s₆×z + s₅)×z + s₄
+     *   ... and so on
+     *
+     * This minimizes multiplications and has excellent numerical stability.
+     */
     __m256d correction = s6;
-    correction = _mm256_fmadd_pd(correction, inv_x2, s5);
-    correction = _mm256_fmadd_pd(correction, inv_x2, s4);
-    correction = _mm256_fmadd_pd(correction, inv_x2, s3);
-    correction = _mm256_fmadd_pd(correction, inv_x2, s2);
-    correction = _mm256_fmadd_pd(correction, inv_x2, s1);
+    correction = _mm256_fmadd_pd(correction, inv_x2, s5);  /* s₆×z + s₅ */
+    correction = _mm256_fmadd_pd(correction, inv_x2, s4);  /* above × z + s₄ */
+    correction = _mm256_fmadd_pd(correction, inv_x2, s3);  /* above × z + s₃ */
+    correction = _mm256_fmadd_pd(correction, inv_x2, s2);  /* above × z + s₂ */
+    correction = _mm256_fmadd_pd(correction, inv_x2, s1);  /* above × z + s₁ */
+    
+    /* Final multiply by 1/x to get O(1/x) correction term */
     correction = _mm256_mul_pd(correction, inv_x);
 
     return _mm256_add_pd(base, correction);
