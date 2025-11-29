@@ -169,14 +169,15 @@
 #include <immintrin.h>
 
 #ifndef BOCPD_USE_ASM_KERNEL
-/**
+/** 
  * @brief Toggle between hand-written ASM kernel (1) and C intrinsics (0)
- *
+ * 
  * The ASM kernel provides ~5% better performance on Intel CPUs due to
  * precise instruction scheduling, but the C version is more portable.
  */
 #define BOCPD_USE_ASM_KERNEL 1
 #endif
+
 
 /*=============================================================================
  * INTERLEAVED BLOCK ACCESSORS
@@ -223,10 +224,10 @@
  */
 static inline double iblk_get(const double *buf, size_t idx, size_t field_offset)
 {
-    size_t block = idx / 4; /* Which 4-element superblock */
-    size_t lane = idx & 3;  /* Which lane (0-3), using & for speed */
-
-    /*
+    size_t block = idx / 4;           /* Which 4-element superblock */
+    size_t lane = idx & 3;            /* Which lane (0-3), using & for speed */
+    
+    /* 
      * BOCPD_IBLK_DOUBLES = 32 (doubles per superblock)
      * field_offset is in BYTES, so divide by 8 to get double offset
      */
@@ -262,23 +263,24 @@ static inline void iblk_set(double *buf, size_t idx, size_t field_offset, double
  *   BOCPD_IBLK_BETA    = 192  (bytes 192-223)
  *   BOCPD_IBLK_SS_N    = 224  (bytes 224-255)
  */
-#define IBLK_GET_MU(buf, i) iblk_get(buf, i, BOCPD_IBLK_MU)
-#define IBLK_GET_C1(buf, i) iblk_get(buf, i, BOCPD_IBLK_C1)
-#define IBLK_GET_C2(buf, i) iblk_get(buf, i, BOCPD_IBLK_C2)
+#define IBLK_GET_MU(buf, i)      iblk_get(buf, i, BOCPD_IBLK_MU)
+#define IBLK_GET_C1(buf, i)      iblk_get(buf, i, BOCPD_IBLK_C1)
+#define IBLK_GET_C2(buf, i)      iblk_get(buf, i, BOCPD_IBLK_C2)
 #define IBLK_GET_INV_SSN(buf, i) iblk_get(buf, i, BOCPD_IBLK_INV_SSN)
-#define IBLK_GET_KAPPA(buf, i) iblk_get(buf, i, BOCPD_IBLK_KAPPA)
-#define IBLK_GET_ALPHA(buf, i) iblk_get(buf, i, BOCPD_IBLK_ALPHA)
-#define IBLK_GET_BETA(buf, i) iblk_get(buf, i, BOCPD_IBLK_BETA)
-#define IBLK_GET_SS_N(buf, i) iblk_get(buf, i, BOCPD_IBLK_SS_N)
+#define IBLK_GET_KAPPA(buf, i)   iblk_get(buf, i, BOCPD_IBLK_KAPPA)
+#define IBLK_GET_ALPHA(buf, i)   iblk_get(buf, i, BOCPD_IBLK_ALPHA)
+#define IBLK_GET_BETA(buf, i)    iblk_get(buf, i, BOCPD_IBLK_BETA)
+#define IBLK_GET_SS_N(buf, i)    iblk_get(buf, i, BOCPD_IBLK_SS_N)
 
-#define IBLK_SET_MU(buf, i, v) iblk_set(buf, i, BOCPD_IBLK_MU, v)
-#define IBLK_SET_C1(buf, i, v) iblk_set(buf, i, BOCPD_IBLK_C1, v)
-#define IBLK_SET_C2(buf, i, v) iblk_set(buf, i, BOCPD_IBLK_C2, v)
+#define IBLK_SET_MU(buf, i, v)      iblk_set(buf, i, BOCPD_IBLK_MU, v)
+#define IBLK_SET_C1(buf, i, v)      iblk_set(buf, i, BOCPD_IBLK_C1, v)
+#define IBLK_SET_C2(buf, i, v)      iblk_set(buf, i, BOCPD_IBLK_C2, v)
 #define IBLK_SET_INV_SSN(buf, i, v) iblk_set(buf, i, BOCPD_IBLK_INV_SSN, v)
-#define IBLK_SET_KAPPA(buf, i, v) iblk_set(buf, i, BOCPD_IBLK_KAPPA, v)
-#define IBLK_SET_ALPHA(buf, i, v) iblk_set(buf, i, BOCPD_IBLK_ALPHA, v)
-#define IBLK_SET_BETA(buf, i, v) iblk_set(buf, i, BOCPD_IBLK_BETA, v)
-#define IBLK_SET_SS_N(buf, i, v) iblk_set(buf, i, BOCPD_IBLK_SS_N, v)
+#define IBLK_SET_KAPPA(buf, i, v)   iblk_set(buf, i, BOCPD_IBLK_KAPPA, v)
+#define IBLK_SET_ALPHA(buf, i, v)   iblk_set(buf, i, BOCPD_IBLK_ALPHA, v)
+#define IBLK_SET_BETA(buf, i, v)    iblk_set(buf, i, BOCPD_IBLK_BETA, v)
+#define IBLK_SET_SS_N(buf, i, v)    iblk_set(buf, i, BOCPD_IBLK_SS_N, v)
+
 
 /*=============================================================================
  * FAST SCALAR NATURAL LOGARITHM
@@ -347,8 +349,7 @@ static inline double fast_log_scalar(double x)
      * Type-punning union allows viewing the same 64 bits as either
      * a double or a uint64_t. This is legal in C (but not C++!).
      */
-    union
-    {
+    union {
         double d;
         uint64_t u;
     } u = {.d = x};
@@ -411,10 +412,10 @@ static inline double fast_log_scalar(double x)
      *   1/7 ≈ 0.1428571428571429
      *   1/9 ≈ 0.1111111111111111
      */
-    double poly = 1.0 + t2 * (0.3333333333333333 +                    /* 1/3 */
-                              t2 * (0.2 +                             /* 1/5 */
-                                    t2 * (0.1428571428571429 +        /* 1/7 */
-                                          t2 * 0.1111111111111111))); /* 1/9 */
+    double poly = 1.0 + t2 * (0.3333333333333333 +       /* 1/3 */
+                              t2 * (0.2 +                 /* 1/5 */
+                                    t2 * (0.1428571428571429 +  /* 1/7 */
+                                          t2 * 0.1111111111111111)));  /* 1/9 */
 
     /*
      * STEP 5: Final assembly
@@ -426,6 +427,7 @@ static inline double fast_log_scalar(double x)
      */
     return (double)e * 0.6931471805599453 + 2.0 * t * poly;
 }
+
 
 /*=============================================================================
  * AVX2 SIMD NATURAL LOGARITHM
@@ -479,16 +481,16 @@ static inline __m256d fast_log_avx2(__m256d x)
     /* ─────────────────────────────────────────────────────────────────────
      * CONSTANTS (broadcast to all 4 lanes)
      * ───────────────────────────────────────────────────────────────────── */
-
+    
     const __m256d one = _mm256_set1_pd(1.0);
     const __m256d two = _mm256_set1_pd(2.0);
-    const __m256d ln2 = _mm256_set1_pd(0.6931471805599453); /* ln(2) */
+    const __m256d ln2 = _mm256_set1_pd(0.6931471805599453);  /* ln(2) */
 
     /* Polynomial coefficients for arctanh series */
-    const __m256d c3 = _mm256_set1_pd(0.3333333333333333); /* 1/3 */
-    const __m256d c5 = _mm256_set1_pd(0.2);                /* 1/5 */
-    const __m256d c7 = _mm256_set1_pd(0.1428571428571429); /* 1/7 */
-    const __m256d c9 = _mm256_set1_pd(0.1111111111111111); /* 1/9 */
+    const __m256d c3 = _mm256_set1_pd(0.3333333333333333);   /* 1/3 */
+    const __m256d c5 = _mm256_set1_pd(0.2);                  /* 1/5 */
+    const __m256d c7 = _mm256_set1_pd(0.1428571428571429);   /* 1/7 */
+    const __m256d c9 = _mm256_set1_pd(0.1111111111111111);   /* 1/9 */
 
     /* IEEE-754 bit manipulation masks */
     const __m256i exp_mask = _mm256_set1_epi64x(0x7FF0000000000000ULL);
@@ -496,14 +498,14 @@ static inline __m256d fast_log_avx2(__m256d x)
     const __m256i exp_bias_bits = _mm256_set1_epi64x(0x3FF0000000000000ULL);
 
     /* Magic number for int64 → double conversion */
-    const __m256i magic_i = _mm256_set1_epi64x(0x4330000000000000ULL); /* 2⁵² as bits */
-    const __m256d magic_d = _mm256_set1_pd(4503599627370496.0);        /* 2⁵² as double */
+    const __m256i magic_i = _mm256_set1_epi64x(0x4330000000000000ULL);  /* 2⁵² as bits */
+    const __m256d magic_d = _mm256_set1_pd(4503599627370496.0);          /* 2⁵² as double */
     const __m256d bias_1023 = _mm256_set1_pd(1023.0);
 
     /* ─────────────────────────────────────────────────────────────────────
      * STEP 1: Reinterpret double bits as integers
      * ───────────────────────────────────────────────────────────────────── */
-
+    
     /*
      * _mm256_castpd_si256: Zero-cost reinterpret cast (no instructions)
      * The 256 bits are now treated as 4 × 64-bit integers
@@ -516,7 +518,7 @@ static inline __m256d fast_log_avx2(__m256d x)
      * exp_bits = (xi & exp_mask) >> 52
      *          = raw 11-bit exponent in low bits of each 64-bit lane
      * ───────────────────────────────────────────────────────────────────── */
-
+    
     __m256i exp_bits = _mm256_srli_epi64(_mm256_and_si256(xi, exp_mask), 52);
 
     /*
@@ -539,17 +541,17 @@ static inline __m256d fast_log_avx2(__m256d x)
      * mi = (xi & mantissa_mask) | exp_bias_bits
      *    = keep only mantissa bits, set exponent to 1023 (= 2⁰)
      * ───────────────────────────────────────────────────────────────────── */
-
+    
     __m256i mi = _mm256_or_si256(_mm256_and_si256(xi, mantissa_mask), exp_bias_bits);
     __m256d m = _mm256_castsi256_pd(mi);
 
     /* ─────────────────────────────────────────────────────────────────────
      * STEP 4: Compute t = (m-1)/(m+1), mapping [1,2) → [0, 1/3)
      * ───────────────────────────────────────────────────────────────────── */
-
+    
     __m256d num = _mm256_sub_pd(m, one);
     __m256d den = _mm256_add_pd(m, one);
-    __m256d t = _mm256_div_pd(num, den); /* Only division in the function! */
+    __m256d t = _mm256_div_pd(num, den);   /* Only division in the function! */
     __m256d t2 = _mm256_mul_pd(t, t);
 
     /* ─────────────────────────────────────────────────────────────────────
@@ -561,11 +563,11 @@ static inline __m256d fast_log_avx2(__m256d x)
      * Horner's method:
      *   poly = ((((c9) × t² + c7) × t² + c5) × t² + c3) × t² + 1
      * ───────────────────────────────────────────────────────────────────── */
-
-    __m256d poly = _mm256_fmadd_pd(t2, c9, c7); /* t² × (1/9) + 1/7 */
-    poly = _mm256_fmadd_pd(t2, poly, c5);       /* t² × (...) + 1/5 */
-    poly = _mm256_fmadd_pd(t2, poly, c3);       /* t² × (...) + 1/3 */
-    poly = _mm256_fmadd_pd(t2, poly, one);      /* t² × (...) + 1   */
+    
+    __m256d poly = _mm256_fmadd_pd(t2, c9, c7);   /* t² × (1/9) + 1/7 */
+    poly = _mm256_fmadd_pd(t2, poly, c5);         /* t² × (...) + 1/5 */
+    poly = _mm256_fmadd_pd(t2, poly, c3);         /* t² × (...) + 1/3 */
+    poly = _mm256_fmadd_pd(t2, poly, one);        /* t² × (...) + 1   */
 
     /* ─────────────────────────────────────────────────────────────────────
      * STEP 6: Final assembly
@@ -574,7 +576,7 @@ static inline __m256d fast_log_avx2(__m256d x)
      *
      * Using FMA: result = e × ln2 + (2 × t × poly)
      * ───────────────────────────────────────────────────────────────────── */
-
+    
     return _mm256_fmadd_pd(e, ln2, _mm256_mul_pd(two, _mm256_mul_pd(t, poly)));
 }
 
@@ -626,6 +628,7 @@ static inline __m256d fast_log_avx2(__m256d x)
  *   lgamma(x) ≈ (x - 0.5)×ln(x) - x + 0.5×ln(2π)
  *
  *=============================================================================*/
+
 
 /*─────────────────────────────────────────────────────────────────────────────
  * LANCZOS APPROXIMATION (for x < 8)
@@ -688,10 +691,10 @@ static inline __m256d lgamma_lanczos_avx2(__m256d x)
      * ───────────────────────────────────────────────────────────────────── */
     const __m256d half = _mm256_set1_pd(0.5);
     const __m256d one = _mm256_set1_pd(1.0);
-
+    
     /* 0.5 × ln(2π) = 0.5 × ln(6.28318...) ≈ 0.9189385332046727 */
     const __m256d half_ln2pi = _mm256_set1_pd(0.9189385332046727);
-
+    
     /* Lanczos g parameter - optimized for 5-term approximation */
     const __m256d g = _mm256_set1_pd(4.7421875);
 
@@ -714,8 +717,8 @@ static inline __m256d lgamma_lanczos_avx2(__m256d x)
      * Computing all at once enables instruction-level parallelism (ILP).
      * The CPU can execute multiple independent adds in parallel.
      * ───────────────────────────────────────────────────────────────────── */
-    __m256d xp0 = x;                                     /* x + 0 */
-    __m256d xp1 = _mm256_add_pd(x, one);                 /* x + 1 */
+    __m256d xp0 = x;                                    /* x + 0 */
+    __m256d xp1 = _mm256_add_pd(x, one);               /* x + 1 */
     __m256d xp2 = _mm256_add_pd(x, _mm256_set1_pd(2.0)); /* x + 2 */
     __m256d xp3 = _mm256_add_pd(x, _mm256_set1_pd(3.0)); /* x + 3 */
     __m256d xp4 = _mm256_add_pd(x, _mm256_set1_pd(4.0)); /* x + 4 */
@@ -728,11 +731,11 @@ static inline __m256d lgamma_lanczos_avx2(__m256d x)
      * But we CAN overlap with other work thanks to out-of-order execution.
      * ───────────────────────────────────────────────────────────────────── */
     __m256d Ag = c0;
-    Ag = _mm256_add_pd(Ag, _mm256_div_pd(c1, xp0)); /* + c₁/x       */
-    Ag = _mm256_add_pd(Ag, _mm256_div_pd(c2, xp1)); /* + c₂/(x+1)   */
-    Ag = _mm256_add_pd(Ag, _mm256_div_pd(c3, xp2)); /* + c₃/(x+2)   */
-    Ag = _mm256_add_pd(Ag, _mm256_div_pd(c4, xp3)); /* + c₄/(x+3)   */
-    Ag = _mm256_add_pd(Ag, _mm256_div_pd(c5, xp4)); /* + c₅/(x+4)   */
+    Ag = _mm256_add_pd(Ag, _mm256_div_pd(c1, xp0));  /* + c₁/x       */
+    Ag = _mm256_add_pd(Ag, _mm256_div_pd(c2, xp1));  /* + c₂/(x+1)   */
+    Ag = _mm256_add_pd(Ag, _mm256_div_pd(c3, xp2));  /* + c₃/(x+2)   */
+    Ag = _mm256_add_pd(Ag, _mm256_div_pd(c4, xp3));  /* + c₄/(x+3)   */
+    Ag = _mm256_add_pd(Ag, _mm256_div_pd(c5, xp4));  /* + c₅/(x+4)   */
 
     /* ─────────────────────────────────────────────────────────────────────
      * Compute t = x + g - 0.5 (shifted argument for power term)
@@ -762,6 +765,7 @@ static inline __m256d lgamma_lanczos_avx2(__m256d x)
 
     return result;
 }
+
 
 /*─────────────────────────────────────────────────────────────────────────────
  * MINIMAX RATIONAL APPROXIMATION (for 8 ≤ x < 40)
@@ -835,24 +839,24 @@ static inline __m256d lgamma_minimax_avx2(__m256d x)
      * Start from innermost (p₆) and work outward.
      * Each step: result = result × t + next_coeff
      * ───────────────────────────────────────────────────────────────────── */
-    __m256d num = _mm256_set1_pd(3.24529652382012274966e-07);                   /* p₆ */
-    num = _mm256_fmadd_pd(num, t, _mm256_set1_pd(9.88031039418037939582e-06));  /* p₅ */
-    num = _mm256_fmadd_pd(num, t, _mm256_set1_pd(-2.94439844714544881340e-04)); /* p₄ */
-    num = _mm256_fmadd_pd(num, t, _mm256_set1_pd(-1.20710278104312065941e-03)); /* p₃ */
-    num = _mm256_fmadd_pd(num, t, _mm256_set1_pd(3.86885972161250765248e-02));  /* p₂ */
-    num = _mm256_fmadd_pd(num, t, _mm256_set1_pd(4.74218749975000009752e-01));  /* p₁ */
-    num = _mm256_fmadd_pd(num, t, one);                                         /* p₀ = 1 */
+    __m256d num = _mm256_set1_pd(3.24529652382012274966e-07);   /* p₆ */
+    num = _mm256_fmadd_pd(num, t, _mm256_set1_pd(9.88031039418037939582e-06));   /* p₅ */
+    num = _mm256_fmadd_pd(num, t, _mm256_set1_pd(-2.94439844714544881340e-04));  /* p₄ */
+    num = _mm256_fmadd_pd(num, t, _mm256_set1_pd(-1.20710278104312065941e-03));  /* p₃ */
+    num = _mm256_fmadd_pd(num, t, _mm256_set1_pd(3.86885972161250765248e-02));   /* p₂ */
+    num = _mm256_fmadd_pd(num, t, _mm256_set1_pd(4.74218749975000009752e-01));   /* p₁ */
+    num = _mm256_fmadd_pd(num, t, one);  /* p₀ = 1 */
 
     /* ─────────────────────────────────────────────────────────────────────
      * Horner evaluation of denominator Q(t)
      * ───────────────────────────────────────────────────────────────────── */
-    __m256d den = _mm256_set1_pd(8.32021972758041118442e-08);                   /* q₆ */
-    den = _mm256_fmadd_pd(den, t, _mm256_set1_pd(4.97570295032256324424e-06));  /* q₅ */
-    den = _mm256_fmadd_pd(den, t, _mm256_set1_pd(-1.31107523028095547946e-04)); /* q₄ */
-    den = _mm256_fmadd_pd(den, t, _mm256_set1_pd(-1.01478348052546145089e-03)); /* q₃ */
-    den = _mm256_fmadd_pd(den, t, _mm256_set1_pd(2.33329728323008758047e-02));  /* q₂ */
-    den = _mm256_fmadd_pd(den, t, _mm256_set1_pd(4.21289134266929659746e-01));  /* q₁ */
-    den = _mm256_fmadd_pd(den, t, one);                                         /* q₀ = 1 */
+    __m256d den = _mm256_set1_pd(8.32021972758041118442e-08);   /* q₆ */
+    den = _mm256_fmadd_pd(den, t, _mm256_set1_pd(4.97570295032256324424e-06));   /* q₅ */
+    den = _mm256_fmadd_pd(den, t, _mm256_set1_pd(-1.31107523028095547946e-04));  /* q₄ */
+    den = _mm256_fmadd_pd(den, t, _mm256_set1_pd(-1.01478348052546145089e-03));  /* q₃ */
+    den = _mm256_fmadd_pd(den, t, _mm256_set1_pd(2.33329728323008758047e-02));   /* q₂ */
+    den = _mm256_fmadd_pd(den, t, _mm256_set1_pd(4.21289134266929659746e-01));   /* q₁ */
+    den = _mm256_fmadd_pd(den, t, one);  /* q₀ = 1 */
 
     /* ─────────────────────────────────────────────────────────────────────
      * Rational correction R(t) = P(t) / Q(t)
@@ -871,6 +875,7 @@ static inline __m256d lgamma_minimax_avx2(__m256d x)
      * ───────────────────────────────────────────────────────────────────── */
     return _mm256_add_pd(core, frac);
 }
+
 
 /*─────────────────────────────────────────────────────────────────────────────
  * STIRLING'S ASYMPTOTIC EXPANSION (for x ≥ 40)
@@ -955,7 +960,7 @@ static inline __m256d lgamma_stirling_avx2(__m256d x)
     /* ─────────────────────────────────────────────────────────────────────
      * Compute 1/x and 1/x² for the correction series
      * ───────────────────────────────────────────────────────────────────── */
-    __m256d inv_x = _mm256_div_pd(one, x); /* Only division! */
+    __m256d inv_x = _mm256_div_pd(one, x);    /* Only division! */
     __m256d inv_x2 = _mm256_mul_pd(inv_x, inv_x);
 
     /* ─────────────────────────────────────────────────────────────────────
@@ -988,6 +993,7 @@ static inline __m256d lgamma_stirling_avx2(__m256d x)
      * ───────────────────────────────────────────────────────────────────── */
     return _mm256_add_pd(base, correction);
 }
+
 
 /*─────────────────────────────────────────────────────────────────────────────
  * BRANCHLESS LGAMMA (fallback for mixed-range vectors)
@@ -1031,9 +1037,9 @@ static inline __m256d fast_lgamma_avx2_branchless(__m256d x)
      * Compute ALL THREE approximations
      * This is expensive but unavoidable for mixed-range vectors.
      * ───────────────────────────────────────────────────────────────────── */
-    __m256d result_small = lgamma_lanczos_avx2(x);  /* Best for x < 8  */
-    __m256d result_mid = lgamma_minimax_avx2(x);    /* Best for 8 ≤ x < 40 */
-    __m256d result_large = lgamma_stirling_avx2(x); /* Best for x ≥ 40 */
+    __m256d result_small = lgamma_lanczos_avx2(x);   /* Best for x < 8  */
+    __m256d result_mid = lgamma_minimax_avx2(x);     /* Best for 8 ≤ x < 40 */
+    __m256d result_large = lgamma_stirling_avx2(x);  /* Best for x ≥ 40 */
 
     /* ─────────────────────────────────────────────────────────────────────
      * Generate comparison masks
@@ -1044,8 +1050,8 @@ static inline __m256d fast_lgamma_avx2_branchless(__m256d x)
      *
      * Each lane of mask is all-1s (0xFFFFFFFFFFFFFFFF) if true, all-0s if false.
      * ───────────────────────────────────────────────────────────────────── */
-    __m256d mask_small = _mm256_cmp_pd(x, eight, _CMP_LT_OQ); /* x < 8?  */
-    __m256d mask_large = _mm256_cmp_pd(x, forty, _CMP_GT_OQ); /* x > 40? */
+    __m256d mask_small = _mm256_cmp_pd(x, eight, _CMP_LT_OQ);   /* x < 8?  */
+    __m256d mask_large = _mm256_cmp_pd(x, forty, _CMP_GT_OQ);   /* x > 40? */
 
     /* ─────────────────────────────────────────────────────────────────────
      * Blend results using masks
@@ -1060,6 +1066,7 @@ static inline __m256d fast_lgamma_avx2_branchless(__m256d x)
 
     return result;
 }
+
 
 /*=============================================================================
  * SHIFTED STORE OPERATIONS
@@ -1137,7 +1144,7 @@ static inline void store_shifted_field(double *buf, size_t block_idx,
      *   rotated[2] = v₁ → goes to block k, lane 2   (index 4k+2)
      *   rotated[3] = v₂ → goes to block k, lane 3   (index 4k+3)
      * ───────────────────────────────────────────────────────────────────── */
-    __m256d rotated = _mm256_permute4x64_pd(vals, 0x93); /* imm8 = 10_01_00_11 */
+    __m256d rotated = _mm256_permute4x64_pd(vals, 0x93);  /* imm8 = 10_01_00_11 */
 
     /* ─────────────────────────────────────────────────────────────────────
      * Calculate block base addresses
@@ -1179,6 +1186,7 @@ static inline void store_shifted_field(double *buf, size_t block_idx,
     _mm256_storeu_pd(block_k1, merged_k1);
 }
 
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * END OF PART 2
  *
@@ -1193,6 +1201,7 @@ static inline void store_shifted_field(double *buf, size_t block_idx,
 /*=============================================================================
  * PART 3: INITIALIZATION, POSTERIOR UPDATE, PREDICTION, AND PUBLIC API
  *=============================================================================*/
+
 
 /*─────────────────────────────────────────────────────────────────────────────
  * SLOT ZERO INITIALIZATION
@@ -1236,10 +1245,10 @@ static inline void init_slot_zero(bocpd_asm_t *b)
     double *next = BOCPD_NEXT_BUF(b);
 
     /* Extract prior parameters for readability */
-    const double kappa0 = b->prior.kappa0; /* Precision pseudo-count */
-    const double mu0 = b->prior.mu0;       /* Prior mean */
-    const double alpha0 = b->prior.alpha0; /* Shape (half degrees of freedom) */
-    const double beta0 = b->prior.beta0;   /* Scale (sum of squares / 2) */
+    const double kappa0 = b->prior.kappa0;   /* Precision pseudo-count */
+    const double mu0 = b->prior.mu0;         /* Prior mean */
+    const double alpha0 = b->prior.alpha0;   /* Shape (half degrees of freedom) */
+    const double beta0 = b->prior.beta0;     /* Scale (sum of squares / 2) */
 
     /* ─────────────────────────────────────────────────────────────────────
      * Compute Student-t predictive parameters
@@ -1251,7 +1260,7 @@ static inline void init_slot_zero(bocpd_asm_t *b)
      * The actual variance would be σ² × ν/(ν-2) for ν > 2.
      * ───────────────────────────────────────────────────────────────────── */
     double sigma_sq = beta0 * (kappa0 + 1.0) / (alpha0 * kappa0);
-    double nu = 2.0 * alpha0; /* Degrees of freedom */
+    double nu = 2.0 * alpha0;  /* Degrees of freedom */
 
     /* ─────────────────────────────────────────────────────────────────────
      * Precompute Student-t constants for fast prediction
@@ -1283,25 +1292,26 @@ static inline void init_slot_zero(bocpd_asm_t *b)
      * only lane 0 is "active", lanes 1-3 must contain valid values to
      * prevent NaN/Inf propagation and division-by-zero crashes.
      * ───────────────────────────────────────────────────────────────────── */
-    __m256d v_mu = _mm256_set1_pd(mu0);
-    __m256d v_kappa = _mm256_set1_pd(kappa0);
-    __m256d v_alpha = _mm256_set1_pd(alpha0);
-    __m256d v_beta = _mm256_set1_pd(beta0);
-    __m256d v_ss_n = _mm256_set1_pd(0.0); /* No samples yet */
-    __m256d v_C1 = _mm256_set1_pd(C1);
-    __m256d v_C2 = _mm256_set1_pd(C2);
+    __m256d v_mu      = _mm256_set1_pd(mu0);
+    __m256d v_kappa   = _mm256_set1_pd(kappa0);
+    __m256d v_alpha   = _mm256_set1_pd(alpha0);
+    __m256d v_beta    = _mm256_set1_pd(beta0);
+    __m256d v_ss_n    = _mm256_set1_pd(0.0);    /* No samples yet */
+    __m256d v_C1      = _mm256_set1_pd(C1);
+    __m256d v_C2      = _mm256_set1_pd(C2);
     __m256d v_inv_ssn = _mm256_set1_pd(inv_ssn);
 
     /* Store all 8 fields to block 0 (each store writes 4 lanes) */
-    _mm256_storeu_pd(next + BOCPD_IBLK_MU / 8, v_mu);
-    _mm256_storeu_pd(next + BOCPD_IBLK_KAPPA / 8, v_kappa);
-    _mm256_storeu_pd(next + BOCPD_IBLK_ALPHA / 8, v_alpha);
-    _mm256_storeu_pd(next + BOCPD_IBLK_BETA / 8, v_beta);
-    _mm256_storeu_pd(next + BOCPD_IBLK_SS_N / 8, v_ss_n);
-    _mm256_storeu_pd(next + BOCPD_IBLK_C1 / 8, v_C1);
-    _mm256_storeu_pd(next + BOCPD_IBLK_C2 / 8, v_C2);
+    _mm256_storeu_pd(next + BOCPD_IBLK_MU / 8,      v_mu);
+    _mm256_storeu_pd(next + BOCPD_IBLK_KAPPA / 8,   v_kappa);
+    _mm256_storeu_pd(next + BOCPD_IBLK_ALPHA / 8,   v_alpha);
+    _mm256_storeu_pd(next + BOCPD_IBLK_BETA / 8,    v_beta);
+    _mm256_storeu_pd(next + BOCPD_IBLK_SS_N / 8,    v_ss_n);
+    _mm256_storeu_pd(next + BOCPD_IBLK_C1 / 8,      v_C1);
+    _mm256_storeu_pd(next + BOCPD_IBLK_C2 / 8,      v_C2);
     _mm256_storeu_pd(next + BOCPD_IBLK_INV_SSN / 8, v_inv_ssn);
 }
+
 
 /*─────────────────────────────────────────────────────────────────────────────
  * CORE BLOCK PROCESSING KERNEL
@@ -1362,7 +1372,7 @@ static inline void process_block_common(
     /* ═════════════════════════════════════════════════════════════════════
      * STEP 1: Load current posterior parameters
      * ═════════════════════════════════════════════════════════════════════ */
-
+    
     __m256d mu_old = _mm256_loadu_pd(src + BOCPD_IBLK_MU / 8);
     __m256d kappa_old = _mm256_loadu_pd(src + BOCPD_IBLK_KAPPA / 8);
     __m256d alpha_old = _mm256_loadu_pd(src + BOCPD_IBLK_ALPHA / 8);
@@ -1378,15 +1388,15 @@ static inline void process_block_common(
      *   α_new = α_old + 0.5
      *   β_new = β_old + 0.5 × (x - μ_old) × (x - μ_new)   [Welford]
      * ═════════════════════════════════════════════════════════════════════ */
-
+    
     __m256d ss_n_new = _mm256_add_pd(ss_n_old, one);
     __m256d kappa_new = _mm256_add_pd(kappa_old, one);
-
+    
     /* μ_new = (κ_old × μ_old + x) / κ_new */
     __m256d mu_new = _mm256_div_pd(
-        _mm256_fmadd_pd(kappa_old, mu_old, x_vec), /* κ_old × μ_old + x */
+        _mm256_fmadd_pd(kappa_old, mu_old, x_vec),  /* κ_old × μ_old + x */
         kappa_new);
-
+    
     __m256d alpha_new = _mm256_add_pd(alpha_old, half);
 
     /* ─────────────────────────────────────────────────────────────────────
@@ -1395,8 +1405,8 @@ static inline void process_block_common(
      * This is numerically stable because we never compute Σx² - n×x̄²,
      * which would suffer from catastrophic cancellation.
      * ───────────────────────────────────────────────────────────────────── */
-    __m256d delta1 = _mm256_sub_pd(x_vec, mu_old); /* x - μ_old */
-    __m256d delta2 = _mm256_sub_pd(x_vec, mu_new); /* x - μ_new */
+    __m256d delta1 = _mm256_sub_pd(x_vec, mu_old);   /* x - μ_old */
+    __m256d delta2 = _mm256_sub_pd(x_vec, mu_new);   /* x - μ_new */
     __m256d beta_inc = _mm256_mul_pd(_mm256_mul_pd(delta1, delta2), half);
     __m256d beta_new = _mm256_add_pd(beta_old, beta_inc);
 
@@ -1406,12 +1416,12 @@ static inline void process_block_common(
      * Scale: σ² = β × (κ + 1) / (α × κ)
      * DOF:   ν = 2α
      * ═════════════════════════════════════════════════════════════════════ */
-
+    
     __m256d kappa_p1 = _mm256_add_pd(kappa_new, one);
     __m256d sigma_sq = _mm256_div_pd(
-        _mm256_mul_pd(beta_new, kappa_p1),    /* β × (κ + 1) */
-        _mm256_mul_pd(alpha_new, kappa_new)); /* α × κ       */
-
+        _mm256_mul_pd(beta_new, kappa_p1),      /* β × (κ + 1) */
+        _mm256_mul_pd(alpha_new, kappa_new));   /* α × κ       */
+    
     __m256d nu = _mm256_mul_pd(two, alpha_new); /* ν = 2α */
     __m256d sigma_sq_nu = _mm256_mul_pd(sigma_sq, nu);
     __m256d inv_ssn = _mm256_div_pd(one, sigma_sq_nu);
@@ -1426,7 +1436,7 @@ static inline void process_block_common(
      *
      * We need lgamma(α) and lgamma(α + 0.5) for the Student-t constant.
      * ═════════════════════════════════════════════════════════════════════ */
-
+    
     __m256d lg_a = lgamma_fn(alpha_new);
     __m256d alpha_p5 = _mm256_add_pd(alpha_new, half);
     __m256d lg_ap5 = lgamma_fn(alpha_p5);
@@ -1440,13 +1450,13 @@ static inline void process_block_common(
      * These precomputed constants make prediction fast:
      *   ln p(x) = C1 - C2 × ln(1 + (x-μ)² × inv_ssn)
      * ═════════════════════════════════════════════════════════════════════ */
-
+    
     __m256d nu_pi_s2 = _mm256_mul_pd(_mm256_mul_pd(nu, pi), sigma_sq);
     __m256d ln_term = fast_log_avx2(nu_pi_s2);
-
+    
     __m256d C1 = _mm256_sub_pd(lg_ap5, lg_a);
-    C1 = _mm256_fnmadd_pd(half, ln_term, C1); /* C1 = C1 - 0.5 × ln_term */
-
+    C1 = _mm256_fnmadd_pd(half, ln_term, C1);  /* C1 = C1 - 0.5 × ln_term */
+    
     __m256d C2 = alpha_p5;
 
     /* ═════════════════════════════════════════════════════════════════════
@@ -1455,7 +1465,7 @@ static inline void process_block_common(
      * Values computed for indices [4k, 4k+1, 4k+2, 4k+3]
      * get stored at indices [4k+1, 4k+2, 4k+3, 4k+4]
      * ═════════════════════════════════════════════════════════════════════ */
-
+    
     store_shifted_field(next, block, BOCPD_IBLK_MU, mu_new);
     store_shifted_field(next, block, BOCPD_IBLK_KAPPA, kappa_new);
     store_shifted_field(next, block, BOCPD_IBLK_ALPHA, alpha_new);
@@ -1465,6 +1475,7 @@ static inline void process_block_common(
     store_shifted_field(next, block, BOCPD_IBLK_C2, C2);
     store_shifted_field(next, block, BOCPD_IBLK_INV_SSN, inv_ssn);
 }
+
 
 /*─────────────────────────────────────────────────────────────────────────────
  * FUSED POSTERIOR UPDATE WITH REGION-SPECIFIC LGAMMA DISPATCH
@@ -1531,9 +1542,8 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
     /* Always initialize slot 0 with prior (changepoint hypothesis) */
     init_slot_zero(b);
 
-    if (n_old == 0)
-    {
-        b->cur_buf = 1 - b->cur_buf; /* Swap buffers */
+    if (n_old == 0) {
+        b->cur_buf = 1 - b->cur_buf;  /* Swap buffers */
         return;
     }
 
@@ -1548,7 +1558,7 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
     const __m256d pi = _mm256_set1_pd(M_PI);
 
     const double alpha0 = b->prior.alpha0;
-    const size_t n_blocks = (n_old + 3) / 4; /* Ceiling division */
+    const size_t n_blocks = (n_old + 3) / 4;  /* Ceiling division */
 
     /* ═════════════════════════════════════════════════════════════════════
      * CALCULATE REGION TRANSITION BLOCKS
@@ -1561,15 +1571,11 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
      *   α₀ + 2k + 2.0 < 8  →  k < (6 - α₀) / 2
      * ───────────────────────────────────────────────────────────────────── */
     size_t lanczos_safe_end;
-    if (alpha0 >= 6.0)
-    {
-        lanczos_safe_end = 0; /* α already ≥ 8 at block 0 */
-    }
-    else
-    {
+    if (alpha0 >= 6.0) {
+        lanczos_safe_end = 0;  /* α already ≥ 8 at block 0 */
+    } else {
         lanczos_safe_end = (size_t)((6.0 - alpha0) / 2.0);
-        if (lanczos_safe_end > n_blocks)
-            lanczos_safe_end = n_blocks;
+        if (lanczos_safe_end > n_blocks) lanczos_safe_end = n_blocks;
     }
 
     /* ─────────────────────────────────────────────────────────────────────
@@ -1577,12 +1583,9 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
      *   α₀ + 2k + 0.5 ≥ 8  →  k ≥ ceil((7.5 - α₀) / 2)
      * ───────────────────────────────────────────────────────────────────── */
     size_t minimax_safe_start;
-    if (alpha0 >= 7.5)
-    {
-        minimax_safe_start = 0; /* Already in minimax range */
-    }
-    else
-    {
+    if (alpha0 >= 7.5) {
+        minimax_safe_start = 0;  /* Already in minimax range */
+    } else {
         minimax_safe_start = (size_t)ceil((7.5 - alpha0) / 2.0);
     }
 
@@ -1591,15 +1594,11 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
      *   α₀ + 2k + 2.0 < 40  →  k < (38 - α₀) / 2
      * ───────────────────────────────────────────────────────────────────── */
     size_t minimax_safe_end;
-    if (alpha0 >= 38.0)
-    {
-        minimax_safe_end = 0; /* Already past minimax range */
-    }
-    else
-    {
+    if (alpha0 >= 38.0) {
+        minimax_safe_end = 0;  /* Already past minimax range */
+    } else {
         minimax_safe_end = (size_t)((38.0 - alpha0) / 2.0);
-        if (minimax_safe_end > n_blocks)
-            minimax_safe_end = n_blocks;
+        if (minimax_safe_end > n_blocks) minimax_safe_end = n_blocks;
     }
 
     /* ─────────────────────────────────────────────────────────────────────
@@ -1607,13 +1606,76 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
      *   α₀ + 2k + 0.5 ≥ 40  →  k ≥ ceil((39.5 - α₀) / 2)
      * ───────────────────────────────────────────────────────────────────── */
     size_t stirling_safe_start;
-    if (alpha0 >= 39.5)
-    {
-        stirling_safe_start = 0; /* Already in Stirling range */
-    }
-    else
-    {
+    if (alpha0 >= 39.5) {
+        stirling_safe_start = 0;  /* Already in Stirling range */
+    } else {
         stirling_safe_start = (size_t)ceil((39.5 - alpha0) / 2.0);
+    }
+
+    /* ═════════════════════════════════════════════════════════════════════
+     * PRE-FILL TAIL BLOCKS WITH VALID PRIOR VALUES
+     *
+     * CRITICAL: This must happen BEFORE the SIMD loop!
+     *
+     * The NEXT buffer is reused via ping-pong. store_shifted_field() does
+     * a read-modify-write that preserves lanes 1,2,3 when writing lane 0.
+     * If those lanes contain garbage (stale data from 2 iterations ago),
+     * the garbage propagates and causes crashes.
+     *
+     * ❌ WRONG: Filling with zeros causes:
+     *    - α = 0 → invalid for lgamma
+     *    - κ = 0 → division by zero in sigma_sq = β(κ+1)/(ακ)
+     *    - β = 0 → sigma_sq = 0 → inv_ssn = 1/0 = +Inf
+     *    - These flow into prediction and cause NaN → crash
+     *
+     * ✅ CORRECT: Fill with valid PRIOR parameters:
+     *    - All lanes contain mathematically valid values
+     *    - κ > 0, α > 0, β > 0 → no division by zero
+     *    - C1, C2, inv_ssn computed from prior → safe for prediction
+     *    - Unused lanes will be multiplied by r[i] = 0 → contribute nothing
+     *
+     * We fill 2 blocks starting from first_partial_block to cover:
+     *    - The block containing indices where SIMD stops
+     *    - The next block (store_shifted_field writes to k+1)
+     * ═════════════════════════════════════════════════════════════════════ */
+    {
+        size_t first_partial_block = n_old / 4;
+
+        /* Compute valid prior-based parameters (same as init_slot_zero) */
+        const double k0 = b->prior.kappa0;
+        const double mu0 = b->prior.mu0;
+        const double a0 = b->prior.alpha0;
+        const double b0_prior = b->prior.beta0;
+
+        double sigma_sq0 = b0_prior * (k0 + 1.0) / (a0 * k0);
+        double nu0 = 2.0 * a0;
+        double C1_0 = b->prior_lgamma_alpha_p5 - b->prior_lgamma_alpha -
+                      0.5 * fast_log_scalar(nu0 * M_PI * sigma_sq0);
+        double C2_0 = a0 + 0.5;
+        double inv_ssn0 = 1.0 / (sigma_sq0 * nu0);
+
+        /* Broadcast prior values to vectors */
+        __m256d v_mu     = _mm256_set1_pd(mu0);
+        __m256d v_kappa  = _mm256_set1_pd(k0);
+        __m256d v_alpha  = _mm256_set1_pd(a0);
+        __m256d v_beta   = _mm256_set1_pd(b0_prior);
+        __m256d v_ssn    = _mm256_set1_pd(0.0);      /* No samples in prior */
+        __m256d v_C1     = _mm256_set1_pd(C1_0);
+        __m256d v_C2     = _mm256_set1_pd(C2_0);
+        __m256d v_invssn = _mm256_set1_pd(inv_ssn0);
+
+        /* Fill 2 blocks with valid prior values */
+        for (size_t zb = 0; zb < 2; zb++) {
+            double *blk = next + (first_partial_block + zb) * BOCPD_IBLK_DOUBLES;
+            _mm256_storeu_pd(blk + BOCPD_IBLK_MU / 8,      v_mu);
+            _mm256_storeu_pd(blk + BOCPD_IBLK_KAPPA / 8,   v_kappa);
+            _mm256_storeu_pd(blk + BOCPD_IBLK_ALPHA / 8,   v_alpha);
+            _mm256_storeu_pd(blk + BOCPD_IBLK_BETA / 8,    v_beta);
+            _mm256_storeu_pd(blk + BOCPD_IBLK_SS_N / 8,    v_ssn);
+            _mm256_storeu_pd(blk + BOCPD_IBLK_C1 / 8,      v_C1);
+            _mm256_storeu_pd(blk + BOCPD_IBLK_C2 / 8,      v_C2);
+            _mm256_storeu_pd(blk + BOCPD_IBLK_INV_SSN / 8, v_invssn);
+        }
     }
 
     size_t block = 0;
@@ -1627,74 +1689,67 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
      *   2. store_shifted_field writes to block k+1, potentially OOB
      * The scalar tail handles any remaining elements safely.
      * ═════════════════════════════════════════════════════════════════════ */
-    for (; block < lanczos_safe_end && block < n_blocks; block++)
-    {
+    for (; block < lanczos_safe_end && block < n_blocks; block++) {
         size_t start = block * 4;
-        if (start + 3 >= n_old)
-            break; /* Prevent partial block processing */
+        if (start + 3 >= n_old) break;  /* Prevent partial block processing */
         const double *src = cur + block * BOCPD_IBLK_DOUBLES;
         process_block_common(src, next, block, x_vec, one, two, half, pi,
-                             lgamma_lanczos_avx2);
+                            lgamma_lanczos_avx2);
     }
 
     /* ═════════════════════════════════════════════════════════════════════
      * REGION 2: Transition zone (spans Lanczos/Minimax boundary at α=8)
      * ═════════════════════════════════════════════════════════════════════ */
-    for (; block < minimax_safe_start && block < n_blocks; block++)
-    {
+    for (; block < minimax_safe_start && block < n_blocks; block++) {
         size_t start = block * 4;
-        if (start + 3 >= n_old)
-            break; /* Prevent partial block processing */
+        if (start + 3 >= n_old) break;  /* Prevent partial block processing */
         const double *src = cur + block * BOCPD_IBLK_DOUBLES;
         process_block_common(src, next, block, x_vec, one, two, half, pi,
-                             fast_lgamma_avx2_branchless); /* Computes all 3 */
+                            fast_lgamma_avx2_branchless);  /* Computes all 3 */
     }
 
     /* ═════════════════════════════════════════════════════════════════════
      * REGION 3: Pure Minimax (8 ≤ α < 40)
      * ═════════════════════════════════════════════════════════════════════ */
-    for (; block < minimax_safe_end && block < n_blocks; block++)
-    {
+    for (; block < minimax_safe_end && block < n_blocks; block++) {
         size_t start = block * 4;
-        if (start + 3 >= n_old)
-            break; /* Prevent partial block processing */
+        if (start + 3 >= n_old) break;  /* Prevent partial block processing */
         const double *src = cur + block * BOCPD_IBLK_DOUBLES;
         process_block_common(src, next, block, x_vec, one, two, half, pi,
-                             lgamma_minimax_avx2);
+                            lgamma_minimax_avx2);
     }
 
     /* ═════════════════════════════════════════════════════════════════════
      * REGION 4: Transition zone (spans Minimax/Stirling boundary at α=40)
      * ═════════════════════════════════════════════════════════════════════ */
-    for (; block < stirling_safe_start && block < n_blocks; block++)
-    {
+    for (; block < stirling_safe_start && block < n_blocks; block++) {
         size_t start = block * 4;
-        if (start + 3 >= n_old)
-            break; /* Prevent partial block processing */
+        if (start + 3 >= n_old) break;  /* Prevent partial block processing */
         const double *src = cur + block * BOCPD_IBLK_DOUBLES;
         process_block_common(src, next, block, x_vec, one, two, half, pi,
-                             fast_lgamma_avx2_branchless); /* Computes all 3 */
+                            fast_lgamma_avx2_branchless);  /* Computes all 3 */
     }
 
     /* ═════════════════════════════════════════════════════════════════════
      * REGION 5: Pure Stirling (α ≥ 40)
      * ═════════════════════════════════════════════════════════════════════ */
-    for (; block < n_blocks; block++)
-    {
+    for (; block < n_blocks; block++) {
         size_t start = block * 4;
-        if (start + 3 >= n_old)
-            break; /* Prevent partial block processing */
+        if (start + 3 >= n_old) break;  /* Prevent partial block processing */
         const double *src = cur + block * BOCPD_IBLK_DOUBLES;
         process_block_common(src, next, block, x_vec, one, two, half, pi,
-                             lgamma_stirling_avx2);
+                            lgamma_stirling_avx2);
     }
 
     /* ═════════════════════════════════════════════════════════════════════
      * SCALAR TAIL: Handle remaining 0-3 elements that don't fill a block
+     *
+     * The pre-loop zeroing already ensured these blocks contain zeros in
+     * unused lanes. We simply write the valid data to the correct indices.
      * ═════════════════════════════════════════════════════════════════════ */
     size_t i = block * 4;
-    for (; i < n_old; i++)
-    {
+    
+    for (; i < n_old; i++) {
         double ss_n_old = IBLK_GET_SS_N(cur, i);
         double kappa_old = IBLK_GET_KAPPA(cur, i);
         double mu_old = IBLK_GET_MU(cur, i);
@@ -1735,6 +1790,7 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
     b->cur_buf = 1 - b->cur_buf;
 }
 
+
 /*=============================================================================
  * PREDICTION STEP
  *
@@ -1769,8 +1825,7 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
 static void prediction_step(bocpd_asm_t *b, double x)
 {
     const size_t n = b->active_len;
-    if (n == 0)
-        return;
+    if (n == 0) return;
 
     const double thresh = b->trunc_thresh;
     double *params = BOCPD_CUR_BUF(b);
@@ -1781,15 +1836,14 @@ static void prediction_step(bocpd_asm_t *b, double x)
     const size_t n_padded = (n + 7) & ~7ULL;
 
     /* Zero-pad r array beyond active length */
-    for (size_t i = n; i < n_padded + 8; i++)
-        r[i] = 0.0;
+    for (size_t i = n; i < n_padded + 8; i++) r[i] = 0.0;
     memset(r_new, 0, (n_padded + 16) * sizeof(double));
 
     /* Output variables from ASM kernel */
-    double r0_out = 0.0;         /* Accumulated changepoint probability */
-    double max_growth_out = 0.0; /* Maximum growth probability (for MAP) */
-    size_t max_idx_out = 0;      /* Index of maximum */
-    size_t last_valid_out = 0;   /* Last index above truncation threshold */
+    double r0_out = 0.0;           /* Accumulated changepoint probability */
+    double max_growth_out = 0.0;   /* Maximum growth probability (for MAP) */
+    size_t max_idx_out = 0;        /* Index of maximum */
+    size_t last_valid_out = 0;     /* Last index above truncation threshold */
 
     /* Set up arguments structure for ASM kernel */
     bocpd_kernel_args_t args = {
@@ -1804,20 +1858,19 @@ static void prediction_step(bocpd_asm_t *b, double x)
         .r0_out = &r0_out,
         .max_growth_out = &max_growth_out,
         .max_idx_out = &max_idx_out,
-        .last_valid_out = &last_valid_out};
+        .last_valid_out = &last_valid_out
+    };
 
     /* Call the hand-written AVX2 assembly kernel */
     bocpd_fused_loop_avx2(&args);
 
     /* Store r0 (changepoint probability) */
     r_new[0] = r0_out;
-    if (r0_out > thresh && last_valid_out == 0)
-        last_valid_out = 1;
+    if (r0_out > thresh && last_valid_out == 0) last_valid_out = 1;
 
     /* Determine new active length based on truncation */
     size_t new_len = (last_valid_out > 0) ? last_valid_out + 1 : n + 1;
-    if (new_len > b->capacity)
-        new_len = b->capacity;
+    if (new_len > b->capacity) new_len = b->capacity;
 
     size_t new_len_padded = (new_len + 7) & ~7ULL;
 
@@ -1831,18 +1884,16 @@ static void prediction_step(bocpd_asm_t *b, double x)
         sum_acc = _mm256_add_pd(sum_acc, _mm256_loadu_pd(&r_new[i]));
 
     /* Horizontal sum: [a,b,c,d] → a+b+c+d */
-    __m128d lo = _mm256_castpd256_pd128(sum_acc);   /* [a, b] */
-    __m128d hi = _mm256_extractf128_pd(sum_acc, 1); /* [c, d] */
-    lo = _mm_add_pd(lo, hi);                        /* [a+c, b+d] */
-    lo = _mm_add_pd(lo, _mm_shuffle_pd(lo, lo, 1)); /* [a+c+b+d, ...] */
+    __m128d lo = _mm256_castpd256_pd128(sum_acc);        /* [a, b] */
+    __m128d hi = _mm256_extractf128_pd(sum_acc, 1);      /* [c, d] */
+    lo = _mm_add_pd(lo, hi);                              /* [a+c, b+d] */
+    lo = _mm_add_pd(lo, _mm_shuffle_pd(lo, lo, 1));       /* [a+c+b+d, ...] */
     double r_sum = _mm_cvtsd_f64(lo);
 
     /* Normalize if sum is non-negligible */
-    if (r_sum > 1e-300)
-    {
+    if (r_sum > 1e-300) {
         __m256d inv_sum = _mm256_set1_pd(1.0 / r_sum);
-        for (size_t i = 0; i < new_len_padded; i += 4)
-        {
+        for (size_t i = 0; i < new_len_padded; i += 4) {
             __m256d rv = _mm256_loadu_pd(&r_new[i]);
             _mm256_storeu_pd(&r[i], _mm256_mul_pd(rv, inv_sum));
         }
@@ -1856,7 +1907,7 @@ static void prediction_step(bocpd_asm_t *b, double x)
     b->map_runlength = (r0_normalized >= max_normalized) ? 0 : max_idx_out;
 }
 
-#else  /* C INTRINSICS FALLBACK */
+#else /* C INTRINSICS FALLBACK */
 
 /*
  * C INTRINSICS VERSION
@@ -1881,8 +1932,7 @@ static void prediction_step(bocpd_asm_t *b, double x)
 static void prediction_step(bocpd_asm_t *b, double x)
 {
     const size_t n = b->active_len;
-    if (n == 0)
-        return;
+    if (n == 0) return;
 
     const double h = b->hazard;
     const double omh = b->one_minus_h;
@@ -1895,8 +1945,7 @@ static void prediction_step(bocpd_asm_t *b, double x)
     const size_t n_padded = (n + 7) & ~7ULL;
 
     /* Initialize arrays */
-    for (size_t j = n; j < n_padded + 8; j++)
-        r[j] = 0.0;
+    for (size_t j = n; j < n_padded + 8; j++) r[j] = 0.0;
     memset(r_new, 0, (n_padded + 16) * sizeof(double));
 
     /* SIMD constants */
@@ -1915,10 +1964,10 @@ static void prediction_step(bocpd_asm_t *b, double x)
     const __m256d log1p_c6 = _mm256_set1_pd(-0.1666666666666667);
 
     /* exp range reduction coefficients */
-    const __m256d exp_inv_ln2 = _mm256_set1_pd(1.4426950408889634); /* 1/ln(2) */
-    const __m256d exp_min_x = _mm256_set1_pd(-700.0);               /* Underflow protection */
-    const __m256d exp_max_x = _mm256_set1_pd(700.0);                /* Overflow protection */
-    const __m256d exp_c1 = _mm256_set1_pd(0.6931471805599453);      /* ln(2) */
+    const __m256d exp_inv_ln2 = _mm256_set1_pd(1.4426950408889634);  /* 1/ln(2) */
+    const __m256d exp_min_x = _mm256_set1_pd(-700.0);  /* Underflow protection */
+    const __m256d exp_max_x = _mm256_set1_pd(700.0);   /* Overflow protection */
+    const __m256d exp_c1 = _mm256_set1_pd(0.6931471805599453);   /* ln(2) */
     const __m256d exp_c2 = _mm256_set1_pd(0.24022650695910072);
     const __m256d exp_c3 = _mm256_set1_pd(0.05550410866482158);
     const __m256d exp_c4 = _mm256_set1_pd(0.009618129107628477);
@@ -1936,8 +1985,7 @@ static void prediction_step(bocpd_asm_t *b, double x)
     size_t last_valid = 0;
 
     /* Main processing loop - 4 run-lengths per iteration */
-    for (size_t i = 0; i < n_padded; i += 4)
-    {
+    for (size_t i = 0; i < n_padded; i += 4) {
         size_t block = i / 4;
         const double *blk = params + block * BOCPD_IBLK_DOUBLES;
 
@@ -1952,9 +2000,9 @@ static void prediction_step(bocpd_asm_t *b, double x)
          * Student-t log-probability: ln p(x) = C1 - C2 × log1p(t)
          * where t = (x - μ)² × inv_ssn
          * ═══════════════════════════════════════════════════════════════ */
-        __m256d z = _mm256_sub_pd(x_vec, mu);   /* z = x - μ */
-        __m256d z2 = _mm256_mul_pd(z, z);       /* z² */
-        __m256d t = _mm256_mul_pd(z2, inv_ssn); /* t = z² × inv_ssn */
+        __m256d z = _mm256_sub_pd(x_vec, mu);        /* z = x - μ */
+        __m256d z2 = _mm256_mul_pd(z, z);            /* z² */
+        __m256d t = _mm256_mul_pd(z2, inv_ssn);      /* t = z² × inv_ssn */
 
         /* log1p(t) via polynomial: t × (1 - t/2 + t²/3 - t³/4 + ...) */
         __m256d poly = _mm256_fmadd_pd(t, log1p_c6, log1p_c5);
@@ -1974,9 +2022,9 @@ static void prediction_step(bocpd_asm_t *b, double x)
          * where k = round(x/ln2), f = x/ln2 - k
          * ═══════════════════════════════════════════════════════════════ */
         __m256d x_clamp = _mm256_max_pd(_mm256_min_pd(ln_pp, exp_max_x), exp_min_x);
-        __m256d t_exp = _mm256_mul_pd(x_clamp, exp_inv_ln2); /* x / ln(2) */
+        __m256d t_exp = _mm256_mul_pd(x_clamp, exp_inv_ln2);  /* x / ln(2) */
         __m256d k = _mm256_round_pd(t_exp, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-        __m256d f = _mm256_sub_pd(t_exp, k); /* Fractional part */
+        __m256d f = _mm256_sub_pd(t_exp, k);  /* Fractional part */
 
         /* 2^f via Estrin's polynomial (better ILP than Horner) */
         __m256d f2 = _mm256_mul_pd(f, f);
@@ -1989,26 +2037,26 @@ static void prediction_step(bocpd_asm_t *b, double x)
         __m256d exp_p = _mm256_fmadd_pd(f4, q456, q0123);
 
         /* 2^k via IEEE-754 bit manipulation */
-        __m128i k32 = _mm256_cvtpd_epi32(k);              /* Double → int32 */
-        __m256i k64 = _mm256_cvtepi32_epi64(k32);         /* int32 → int64 */
-        __m256i biased = _mm256_add_epi64(k64, exp_bias); /* Add bias 1023 */
-        __m256i bits = _mm256_slli_epi64(biased, 52);     /* Shift to exponent position */
-        __m256d scale = _mm256_castsi256_pd(bits);        /* Reinterpret as double */
+        __m128i k32 = _mm256_cvtpd_epi32(k);           /* Double → int32 */
+        __m256i k64 = _mm256_cvtepi32_epi64(k32);      /* int32 → int64 */
+        __m256i biased = _mm256_add_epi64(k64, exp_bias);  /* Add bias 1023 */
+        __m256i bits = _mm256_slli_epi64(biased, 52);      /* Shift to exponent position */
+        __m256d scale = _mm256_castsi256_pd(bits);         /* Reinterpret as double */
 
         /* pp = 2^f × 2^k */
         __m256d pp = _mm256_mul_pd(exp_p, scale);
-        pp = _mm256_max_pd(pp, min_pp); /* Clamp to avoid underflow */
+        pp = _mm256_max_pd(pp, min_pp);  /* Clamp to avoid underflow */
 
         /* ═══════════════════════════════════════════════════════════════
          * BOCPD update
          * ═══════════════════════════════════════════════════════════════ */
         __m256d r_pp = _mm256_mul_pd(r_old, pp);
-        __m256d growth = _mm256_mul_pd(r_pp, omh_vec); /* r × p × (1-H) */
-        __m256d change = _mm256_mul_pd(r_pp, h_vec);   /* r × p × H */
+        __m256d growth = _mm256_mul_pd(r_pp, omh_vec);  /* r × p × (1-H) */
+        __m256d change = _mm256_mul_pd(r_pp, h_vec);    /* r × p × H */
 
         /* Store growth at shifted index */
         _mm256_storeu_pd(&r_new[i + 1], growth);
-
+        
         /* Accumulate changepoint probability */
         r0_acc = _mm256_add_pd(r0_acc, change);
 
@@ -2022,16 +2070,11 @@ static void prediction_step(bocpd_asm_t *b, double x)
         /* Track truncation threshold */
         __m256d thresh_cmp = _mm256_cmp_pd(growth, thresh_vec, _CMP_GT_OQ);
         int mask = _mm256_movemask_pd(thresh_cmp);
-        if (mask)
-        {
-            if (mask & 8)
-                last_valid = i + 4;
-            else if (mask & 4)
-                last_valid = i + 3;
-            else if (mask & 2)
-                last_valid = i + 2;
-            else if (mask & 1)
-                last_valid = i + 1;
+        if (mask) {
+            if (mask & 8) last_valid = i + 4;
+            else if (mask & 4) last_valid = i + 3;
+            else if (mask & 2) last_valid = i + 2;
+            else if (mask & 1) last_valid = i + 1;
         }
 
         idx_vec = _mm256_add_epi64(idx_vec, idx_inc);
@@ -2045,8 +2088,7 @@ static void prediction_step(bocpd_asm_t *b, double x)
     double r0 = _mm_cvtsd_f64(lo);
 
     r_new[0] = r0;
-    if (r0 > thresh && last_valid == 0)
-        last_valid = 1;
+    if (r0 > thresh && last_valid == 0) last_valid = 1;
 
     /* Extract max from SIMD register */
     double max_arr[4];
@@ -2056,10 +2098,8 @@ static void prediction_step(bocpd_asm_t *b, double x)
 
     double map_val = r0;
     size_t map_idx = 0;
-    for (int j = 0; j < 4; j++)
-    {
-        if (max_arr[j] > map_val)
-        {
+    for (int j = 0; j < 4; j++) {
+        if (max_arr[j] > map_val) {
             map_val = max_arr[j];
             map_idx = idx_arr[j];
         }
@@ -2067,8 +2107,7 @@ static void prediction_step(bocpd_asm_t *b, double x)
 
     /* Normalize */
     size_t new_len = (last_valid > 0) ? last_valid + 1 : n + 1;
-    if (new_len > b->capacity)
-        new_len = b->capacity;
+    if (new_len > b->capacity) new_len = b->capacity;
 
     size_t new_len_padded = (new_len + 3) & ~3ULL;
 
@@ -2082,11 +2121,9 @@ static void prediction_step(bocpd_asm_t *b, double x)
     lo = _mm_add_pd(lo, _mm_shuffle_pd(lo, lo, 1));
     double r_sum = _mm_cvtsd_f64(lo);
 
-    if (r_sum > 1e-300)
-    {
+    if (r_sum > 1e-300) {
         __m256d inv_sum = _mm256_set1_pd(1.0 / r_sum);
-        for (size_t j = 0; j < new_len_padded; j += 4)
-        {
+        for (size_t j = 0; j < new_len_padded; j += 4) {
             __m256d rv = _mm256_loadu_pd(&r_new[j]);
             _mm256_storeu_pd(&r[j], _mm256_mul_pd(rv, inv_sum));
         }
@@ -2096,6 +2133,7 @@ static void prediction_step(bocpd_asm_t *b, double x)
     b->map_runlength = map_idx;
 }
 #endif /* BOCPD_USE_ASM_KERNEL */
+
 
 /*=============================================================================
  * PUBLIC API
@@ -2134,8 +2172,7 @@ int bocpd_ultra_init(bocpd_asm_t *b, double hazard_lambda,
 
     /* Round capacity up to power of 2 for efficient modulo */
     size_t cap = 32;
-    while (cap < max_run_length)
-        cap <<= 1;
+    while (cap < max_run_length) cap <<= 1;
 
     b->capacity = cap;
     b->hazard = 1.0 / hazard_lambda;
@@ -2159,22 +2196,17 @@ int bocpd_ultra_init(bocpd_asm_t *b, double hazard_lambda,
     void *mega = _aligned_malloc(total, 64);
 #else
     void *mega = NULL;
-    if (posix_memalign(&mega, 64, total) != 0)
-        mega = NULL;
+    if (posix_memalign(&mega, 64, total) != 0) mega = NULL;
 #endif
 
-    if (!mega)
-        return -1;
+    if (!mega) return -1;
     memset(mega, 0, total);
 
     /* Partition the mega-allocation */
     uint8_t *ptr = (uint8_t *)mega;
-    b->interleaved[0] = (double *)ptr;
-    ptr += bytes_interleaved;
-    b->interleaved[1] = (double *)ptr;
-    ptr += bytes_interleaved;
-    b->r = (double *)ptr;
-    ptr += bytes_r;
+    b->interleaved[0] = (double *)ptr; ptr += bytes_interleaved;
+    b->interleaved[1] = (double *)ptr; ptr += bytes_interleaved;
+    b->r = (double *)ptr; ptr += bytes_r;
     b->r_scratch = (double *)ptr;
 
     b->mega = mega;
@@ -2190,11 +2222,9 @@ int bocpd_ultra_init(bocpd_asm_t *b, double hazard_lambda,
  */
 void bocpd_ultra_free(bocpd_asm_t *b)
 {
-    if (!b)
-        return;
+    if (!b) return;
 #ifdef _WIN32
-    if (b->mega)
-        _aligned_free(b->mega);
+    if (b->mega) _aligned_free(b->mega);
 #else
     free(b->mega);
 #endif
@@ -2206,8 +2236,7 @@ void bocpd_ultra_free(bocpd_asm_t *b)
  */
 void bocpd_ultra_reset(bocpd_asm_t *b)
 {
-    if (!b)
-        return;
+    if (!b) return;
 
     memset(b->r, 0, (b->capacity + 32) * sizeof(double));
     memset(b->r_scratch, 0, (b->capacity + 32) * sizeof(double));
@@ -2247,8 +2276,7 @@ void bocpd_ultra_reset(bocpd_asm_t *b)
  */
 void bocpd_ultra_step(bocpd_asm_t *b, double x)
 {
-    if (!b)
-        return;
+    if (!b) return;
 
     /* ═══════════════════════════════════════════════════════════════════════
      * First observation: special initialization
@@ -2266,8 +2294,7 @@ void bocpd_ultra_step(bocpd_asm_t *b, double x)
      *
      * Solution: Broadcast the same valid values to all 4 lanes.
      * ═══════════════════════════════════════════════════════════════════════ */
-    if (b->t == 0)
-    {
+    if (b->t == 0) {
         b->r[0] = 1.0;
 
         double *cur = BOCPD_CUR_BUF(b);
@@ -2297,22 +2324,22 @@ void bocpd_ultra_step(bocpd_asm_t *b, double x)
          *   - NaN in lgamma calls
          *   - Inf in 1/0 computations
          * ───────────────────────────────────────────────────────────────────── */
-        __m256d v_mu = _mm256_set1_pd(mu1);
-        __m256d v_kappa = _mm256_set1_pd(k1);
-        __m256d v_alpha = _mm256_set1_pd(a1);
-        __m256d v_beta = _mm256_set1_pd(beta1);
-        __m256d v_ss_n = _mm256_set1_pd(1.0);
-        __m256d v_C1 = _mm256_set1_pd(C1);
-        __m256d v_C2 = _mm256_set1_pd(C2);
+        __m256d v_mu      = _mm256_set1_pd(mu1);
+        __m256d v_kappa   = _mm256_set1_pd(k1);
+        __m256d v_alpha   = _mm256_set1_pd(a1);
+        __m256d v_beta    = _mm256_set1_pd(beta1);
+        __m256d v_ss_n    = _mm256_set1_pd(1.0);
+        __m256d v_C1      = _mm256_set1_pd(C1);
+        __m256d v_C2      = _mm256_set1_pd(C2);
         __m256d v_inv_ssn = _mm256_set1_pd(inv_ssn);
 
-        _mm256_storeu_pd(cur + BOCPD_IBLK_MU / 8, v_mu);
-        _mm256_storeu_pd(cur + BOCPD_IBLK_KAPPA / 8, v_kappa);
-        _mm256_storeu_pd(cur + BOCPD_IBLK_ALPHA / 8, v_alpha);
-        _mm256_storeu_pd(cur + BOCPD_IBLK_BETA / 8, v_beta);
-        _mm256_storeu_pd(cur + BOCPD_IBLK_SS_N / 8, v_ss_n);
-        _mm256_storeu_pd(cur + BOCPD_IBLK_C1 / 8, v_C1);
-        _mm256_storeu_pd(cur + BOCPD_IBLK_C2 / 8, v_C2);
+        _mm256_storeu_pd(cur + BOCPD_IBLK_MU / 8,      v_mu);
+        _mm256_storeu_pd(cur + BOCPD_IBLK_KAPPA / 8,   v_kappa);
+        _mm256_storeu_pd(cur + BOCPD_IBLK_ALPHA / 8,   v_alpha);
+        _mm256_storeu_pd(cur + BOCPD_IBLK_BETA / 8,    v_beta);
+        _mm256_storeu_pd(cur + BOCPD_IBLK_SS_N / 8,    v_ss_n);
+        _mm256_storeu_pd(cur + BOCPD_IBLK_C1 / 8,      v_C1);
+        _mm256_storeu_pd(cur + BOCPD_IBLK_C2 / 8,      v_C2);
         _mm256_storeu_pd(cur + BOCPD_IBLK_INV_SSN / 8, v_inv_ssn);
 
         b->active_len = 1;
@@ -2330,10 +2357,10 @@ void bocpd_ultra_step(bocpd_asm_t *b, double x)
     /* Compute changepoint probability as sum of first 5 run-lengths */
     double p = 0.0;
     size_t lim = (b->active_len < 5) ? b->active_len : 5;
-    for (size_t j = 0; j < lim; j++)
-        p += b->r[j];
+    for (size_t j = 0; j < lim; j++) p += b->r[j];
     b->p_changepoint = p;
 }
+
 
 /*=============================================================================
  * POOL ALLOCATOR API
@@ -2355,8 +2382,7 @@ int bocpd_pool_init(bocpd_pool_t *pool, size_t n_detectors,
     memset(pool, 0, sizeof(*pool));
 
     size_t cap = 32;
-    while (cap < max_run_length)
-        cap <<= 1;
+    while (cap < max_run_length) cap <<= 1;
 
     size_t n_blocks = cap / 4 + 2;
     size_t bytes_interleaved = n_blocks * BOCPD_IBLK_STRIDE;
@@ -2373,12 +2399,10 @@ int bocpd_pool_init(bocpd_pool_t *pool, size_t n_detectors,
     void *mega = _aligned_malloc(total, 64);
 #else
     void *mega = NULL;
-    if (posix_memalign(&mega, 64, total) != 0)
-        mega = NULL;
+    if (posix_memalign(&mega, 64, total) != 0) mega = NULL;
 #endif
 
-    if (!mega)
-        return -1;
+    if (!mega) return -1;
     memset(mega, 0, total);
 
     pool->pool = mega;
@@ -2392,8 +2416,7 @@ int bocpd_pool_init(bocpd_pool_t *pool, size_t n_detectors,
 
     uint8_t *data_base = (uint8_t *)mega + struct_size;
 
-    for (size_t d = 0; d < n_detectors; d++)
-    {
+    for (size_t d = 0; d < n_detectors; d++) {
         bocpd_asm_t *b = &pool->detectors[d];
         uint8_t *ptr = data_base + d * bytes_per_detector;
 
@@ -2406,15 +2429,12 @@ int bocpd_pool_init(bocpd_pool_t *pool, size_t n_detectors,
         b->prior_lgamma_alpha = prior_lgamma_alpha;
         b->prior_lgamma_alpha_p5 = prior_lgamma_alpha_p5;
 
-        b->interleaved[0] = (double *)ptr;
-        ptr += bytes_interleaved;
-        b->interleaved[1] = (double *)ptr;
-        ptr += bytes_interleaved;
-        b->r = (double *)ptr;
-        ptr += bytes_r;
+        b->interleaved[0] = (double *)ptr; ptr += bytes_interleaved;
+        b->interleaved[1] = (double *)ptr; ptr += bytes_interleaved;
+        b->r = (double *)ptr; ptr += bytes_r;
         b->r_scratch = (double *)ptr;
 
-        b->mega = NULL; /* Pool-managed */
+        b->mega = NULL;  /* Pool-managed */
         b->mega_bytes = 0;
         b->t = 0;
         b->active_len = 0;
@@ -2425,11 +2445,9 @@ int bocpd_pool_init(bocpd_pool_t *pool, size_t n_detectors,
 
 void bocpd_pool_free(bocpd_pool_t *pool)
 {
-    if (!pool)
-        return;
+    if (!pool) return;
 #ifdef _WIN32
-    if (pool->pool)
-        _aligned_free(pool->pool);
+    if (pool->pool) _aligned_free(pool->pool);
 #else
     free(pool->pool);
 #endif
@@ -2438,16 +2456,14 @@ void bocpd_pool_free(bocpd_pool_t *pool)
 
 void bocpd_pool_reset(bocpd_pool_t *pool)
 {
-    if (!pool)
-        return;
+    if (!pool) return;
     for (size_t d = 0; d < pool->n_detectors; d++)
         bocpd_ultra_reset(&pool->detectors[d]);
 }
 
 bocpd_asm_t *bocpd_pool_get(bocpd_pool_t *pool, size_t index)
 {
-    if (!pool || index >= pool->n_detectors)
-        return NULL;
+    if (!pool || index >= pool->n_detectors) return NULL;
     return &pool->detectors[index];
 }
 
