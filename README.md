@@ -19,7 +19,7 @@ BOCPD maintains a probability distribution over "run lengths" — time since the
 | Method | Latency | Detects | Online |
 |--------|---------|---------|--------|
 | CUSUM | ~100ns | Mean shift | ✓ |
-| **BOCPD** | **~0.33µs** | **Mean + Variance** | **✓** |
+| **BOCPD** | **~0.19µs** | **Mean + Variance** | **✓** |
 | HMM | ~50µs | Regimes | ✓ |
 | Offline CPD | ~10ms | All | ✗ |
 
@@ -27,39 +27,40 @@ BOCPD maintains a probability distribution over "run lengths" — time since the
 
 | Configuration | Throughput | Latency |
 |---------------|------------|---------|
-| Single detector | 1.75M obs/sec | 0.57 µs |
-| With changepoints | 3.01M obs/sec | 0.33 µs |
-| Pool (100 instruments) | 2.29M obs/sec | 0.44 µs |
-| Large scale (380 instruments) | 1.58M obs/sec | 0.63 µs |
-| **Peak throughput** | **3.01M obs/sec** | **0.33 µs** |
+| Single detector | 2.43M obs/sec | 0.41 µs |
+| Stationary data (100K) | 1.87M obs/sec | 0.53 µs |
+| With changepoints (100K) | 5.14M obs/sec | 0.19 µs |
+| Pool (100 instruments) | 3.03M obs/sec | 0.33 µs |
+| Large scale (380 instruments) | 2.12M obs/sec | 0.47 µs |
+| **Peak throughput** | **5.14M obs/sec** | **0.19 µs** |
 
 ---
 
 ## Performance
 
-Measured on Intel Core i9-14900K, GCC 12, `-O3 -mavx2 -mfma`:
+Measured on Intel Core i9, GCC/MSVC, `-O3 -mavx2 -mfma`:
 
-### V3.1 Native Interleaved Layout + AVX2 ASM Kernel
+### V3.2 Native Interleaved Layout + AVX2 ASM Kernel
 
 | Test Scenario | Throughput | Latency | Speedup vs Naive |
 |---------------|------------|---------|------------------|
-| Single detector | 1.75M obs/sec | 0.57 µs | 33.5× |
-| Stationary data (100K obs) | 1.42M obs/sec | 0.70 µs | 27× |
-| With changepoints (100K obs) | 3.01M obs/sec | 0.33 µs | 57× |
-| Multi-detector pool (100) | 2.29M obs/sec | 0.44 µs | 12.9× |
-| Large scale (380 × 500) | 1.58M obs/sec | 0.63 µs | - |
+| Single detector | 2.43M obs/sec | 0.41 µs | 46.4× |
+| Stationary data (100K obs) | 1.87M obs/sec | 0.53 µs | 36× |
+| With changepoints (100K obs) | 5.14M obs/sec | 0.19 µs | 99× |
+| Multi-detector pool (100) | 3.03M obs/sec | 0.33 µs | 17.4× |
+| Large scale (380 × 500) | 2.12M obs/sec | 0.47 µs | — |
 
 ### Scaling by max_run_length
 
 | max_run | Throughput | avg_active |
 |---------|------------|------------|
-| 64 | 1.81M obs/sec | 41.3 |
-| 128 | 1.30M obs/sec | 53.1 |
-| 256 | 1.37M obs/sec | 56.5 |
-| 512 | 1.27M obs/sec | 61.4 |
-| 1024 | 1.22M obs/sec | 62.8 |
-| 2048 | 1.39M obs/sec | 56.0 |
-| 4096 | 1.29M obs/sec | 61.2 |
+| 64 | 2.26M obs/sec | 41.3 |
+| 128 | 1.90M obs/sec | 53.1 |
+| 256 | 1.84M obs/sec | 56.5 |
+| 512 | 1.69M obs/sec | 61.4 |
+| 1024 | 1.69M obs/sec | 62.8 |
+| 2048 | 1.87M obs/sec | 56.0 |
+| 4096 | 1.72M obs/sec | 61.2 |
 
 ### vs Reference Implementations
 
@@ -68,8 +69,45 @@ Measured on Intel Core i9-14900K, GCC 12, `-O3 -mavx2 -mfma`:
 | Python (numpy) | ~1.2K obs/sec | 1× |
 | Rust (changepoint) | ~22K obs/sec | 18× |
 | Naive C | 52K obs/sec | 43× |
-| **BOCPD Ultra V3.1** | **1.75M obs/sec** | **1,458×** |
-| **Peak (with changepoints)** | **3.01M obs/sec** | **2,508×** |
+| **BOCPD Ultra V3.2** | **2.43M obs/sec** | **2,025×** |
+| **Peak (with changepoints)** | **5.14M obs/sec** | **4,283×** |
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    BOCPD Ultra V3.2                             │
+├─────────────────────────────────────────────────────────────────┤
+│  Custom lgamma (Lanczos + Stirling)                             │
+│  ├─ Replaces slow libm lgamma() (~100 cycles → ~15 cycles)     │
+│  ├─ Lanczos g=4.7421875 for small args                         │
+│  └─ Stirling with Bernoulli coefficients for large args        │
+├─────────────────────────────────────────────────────────────────┤
+│  Native Interleaved Layout                                      │
+│  ├─ 256-byte superblocks (4 run lengths × 8 parameters)        │
+│  ├─ Prediction params first (cache-friendly)                   │
+│  └─ Zero-copy: no per-step data transformation                 │
+├─────────────────────────────────────────────────────────────────┤
+│  Ping-Pong Double Buffering                                     │
+│  ├─ Two interleaved buffers, alternating each step             │
+│  ├─ Zero memmove operations                                    │
+│  └─ Implicit +1 shift via buffer swap                          │
+├─────────────────────────────────────────────────────────────────┤
+│  AVX2 ASM Kernel                                                │
+│  ├─ 8 elements/iteration (2 blocks × 4 lanes)                  │
+│  ├─ Interleaved Block A/B for ILP                              │
+│  ├─ Estrin polynomial evaluation (reduced latency)             │
+│  ├─ IEEE-754 exponent bit manipulation                         │
+│  └─ bsr-based truncation (no branch mispredicts)               │
+├─────────────────────────────────────────────────────────────────┤
+│  Pool Allocator                                                 │
+│  ├─ Single malloc for N detectors                              │
+│  ├─ Cache-friendly sequential layout                           │
+│  └─ Reduced TLB pressure                                       │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -120,7 +158,59 @@ P(r<5):  .9  .5  .3  .2  .1  .1  .1  .1  .1  .8  .6  .4
 
 ## Optimizations
 
-This section details the engineering that achieves **3.01M obs/sec peak throughput**.
+This section details the engineering that achieves **5.14M obs/sec peak throughput**.
+
+### Custom lgamma Implementation (2× Speedup)
+
+**Problem:** The Student-t log-pdf requires `lgamma((ν+1)/2) - lgamma(ν/2)` for every run length. The standard library `lgamma()` is extremely slow (~100+ cycles) and dominates runtime.
+
+**Solution:** Implement custom lgamma using Lanczos approximation for small arguments and Stirling series for large arguments:
+
+```c
+// Lanczos approximation (ν < 40): ~15 cycles
+// g = 4.7421875 (exactly representable in binary)
+double lgamma_lanczos(double x) {
+    static const double c[7] = {
+        0.99999999999980993,
+        676.5203681218851,
+        -1259.1392167224028,
+        771.32342877765313,
+        -176.61502916214059,
+        12.507343278686905,
+        -0.13857109526572012
+    };
+    // Horner's method evaluation...
+}
+
+// Stirling series (ν ≥ 40): ~12 cycles
+// ln Γ(x) ≈ (x-½)ln(x) - x + ½ln(2π) + Σ B_{2k}/(2k(2k-1)x^{2k-1})
+double lgamma_stirling(double x) {
+    // Bernoulli number coefficients B₂, B₄, B₆, B₈, B₁₀, B₁₂
+    // Achieves ~15 digits precision for x ≥ 40
+}
+```
+
+**Impact:** Replacing `libm lgamma()` with custom implementation gave **~100% speedup** (2× faster). This was the single largest optimization.
+
+### Precomputed Student-t Constants
+
+Full Student-t log-pdf:
+```
+ln p(x) = lgamma((ν+1)/2) - lgamma(ν/2) - ½ln(νπσ²) - ((ν+1)/2)·ln(1 + z²/(νσ²))
+```
+
+Optimized (constants precomputed when posterior updates):
+```
+ln p(x) = C₁ - C₂ · log1p(z² · inv_σ²ν)
+
+C₁ = lgamma(α+½) - lgamma(α) - ½ln(2απσ²)   ← precomputed at update time
+C₂ = α + ½                                    ← precomputed
+inv_σ²ν = 1/(σ²·2α)                          ← precomputed
+```
+
+**Hot path:** 1 multiply, 1 FMA, 1 log1p. **No lgamma, no division.**
+
+The lgamma calls happen only during posterior updates (once per run length that survives truncation), not during prediction (which runs for all active run lengths).
 
 ### V3 Native Interleaved Memory Layout
 
@@ -151,6 +241,30 @@ V3 Layout (native 256-byte superblocks):
 ```
 
 **Impact:** Eliminated O(n) copy, direct SIMD access. ~20% overall speedup.
+
+### Ping-Pong Double Buffering
+
+**Problem:** BOCPD reads from run length r but writes to r+1. Naive approach requires `memmove()` after every step to shift the distribution.
+
+**Solution:** Maintain two buffers, alternate between them:
+```
+Step t (cur_buf = 0):
+  Read:  interleaved[0][r]     → posterior for run length r
+  Write: interleaved[1][r+1]   → updated posterior at r+1
+  Flip:  cur_buf = 1
+
+Step t+1 (cur_buf = 1):
+  Read:  interleaved[1][r]     → now contains what was r+1
+  Write: interleaved[0][r+1]   → write to other buffer
+  Flip:  cur_buf = 0
+```
+
+**Benefits:**
+- Zero `memmove()` operations (was O(n) per step)
+- Implicit +1 index shift via buffer swap
+- No data hazards between read and write
+
+**Impact:** Eliminates ~15-20% overhead from memory copies.
 
 ### Shifted Store with AVX2 Permute
 
@@ -286,24 +400,6 @@ vaddpd   ymm3, [stack], ymm7
 vmovapd  [stack], ymm3
 ```
 
-### Precomputed Student-t Constants
-
-Full Student-t log-pdf:
-```
-ln p(x) = lgamma((ν+1)/2) - lgamma(ν/2) - ½ln(νπσ²) - ((ν+1)/2)·ln(1 + z²/(νσ²))
-```
-
-Optimized (constants precomputed when posterior updates):
-```
-ln p(x) = C₁ - C₂ · log1p(z² · inv_σ²ν)
-
-C₁ = lgamma(α+½) - lgamma(α) - ½ln(2απσ²)   ← precomputed
-C₂ = α + ½                                    ← precomputed
-inv_σ²ν = 1/(σ²·2α)                          ← precomputed
-```
-
-Hot path: 1 multiply, 1 FMA, 1 log1p. No lgamma, no division.
-
 ---
 
 ## Assembly Kernel Architecture
@@ -313,40 +409,37 @@ Hand-written AVX2 kernel optimized for modern x86-64:
 ### Register Allocation (AVX2: 16 YMM registers)
 ```
 Dedicated constants:
-  ymm6  = const_one (1.0)
-  ymm7  = idx_increment (8.0)
-  ymm8  = x (observation, broadcast)
-  ymm9  = h (hazard rate)
-  ymm10 = 1-h
-  ymm11 = threshold
+  ymm12 = threshold
+  ymm13 = 1-h
+  ymm14 = h (hazard rate)
+  ymm15 = x (observation, broadcast)
 
 Accumulators:
-  ymm12 = r0 accumulator
-  ymm13 = max_growth_A
-  ymm14 = max_growth_B
-  ymm15 = idx_vec_A
+  ymm9  = max_growth_B
+  ymm10 = max_growth_A
+  ymm11 = r0 accumulator
 
 Scratch (reused per block):
-  ymm0-5 = computation temporaries
+  ymm0-8 = computation temporaries
 
 Stack storage:
-  idx_vec_B, max_idx_A, max_idx_B
+  idx_vec_A, idx_vec_B, max_idx_A, max_idx_B, r_old_B
 ```
 
 ### Block Addressing (V3 Layout)
 ```asm
 ; Block A: elements [i, i+1, i+2, i+3]
-mov     rax, rsi
+mov     rax, r14
 shr     rax, 2          ; block_index = i / 4
 shl     rax, 8          ; byte_offset = block_index * 256
 
-vmovapd ymm0, [r8 + rax]        ; mu at offset 0
-vmovapd ymm1, [r8 + rax + 32]   ; C1 at offset 32
-vmovapd ymm2, [r8 + rax + 64]   ; C2 at offset 64
-vmovapd ymm3, [r8 + rax + 96]   ; inv_ssn at offset 96
+vmovapd ymm0, [r13 + rax]        ; mu at offset 0
+vmovapd ymm1, [r13 + rax + 32]   ; C1 at offset 32
+vmovapd ymm2, [r13 + rax + 64]   ; C2 at offset 64
+vmovapd ymm3, [r13 + rax + 96]   ; inv_ssn at offset 96
 
 ; Block B: elements [i+4, i+5, i+6, i+7]
-mov     rax, rsi
+mov     rax, r14
 add     rax, 4
 shr     rax, 2
 shl     rax, 8          ; Next block at +256 bytes
@@ -416,7 +509,8 @@ bocpd_pool_init(&pool, 100, 200.0, prior, 1024);
 
 for (int t = 0; t < n_steps; t++) {
     for (int i = 0; i < 100; i++) {
-        bocpd_ultra_step(&pool.detectors[i], data[i][t]);
+        bocpd_asm_t *det = bocpd_pool_get(&pool, i);
+        bocpd_ultra_step(det, data[i][t]);
     }
 }
 
@@ -439,7 +533,7 @@ bocpd_pool_free(&pool);
 
 ## Design Philosophy: Why Not Faster?
 
-This implementation achieves **3.01M obs/sec peak**. Faster is possible — but not without sacrificing correctness.
+This implementation achieves **5.14M obs/sec peak**. Faster is possible — but not without sacrificing correctness.
 
 ### What We Refused To Do
 
@@ -455,7 +549,7 @@ This implementation achieves **3.01M obs/sec peak**. Faster is possible — but 
 
 Anyone claiming 10M+ obs/sec for "BOCPD" is likely doing top-1 path tracking or using garbage polynomials. That's not Bayesian inference.
 
-**3M obs/sec is the performance ceiling given numerical constraints.** For trading systems where wrong signals cost real money, that ceiling is the right place to be.
+**5.14M obs/sec is the performance ceiling given numerical constraints.** For trading systems where wrong signals cost real money, that ceiling is the right place to be.
 
 ---
 
@@ -477,7 +571,8 @@ Anyone claiming 10M+ obs/sec for "BOCPD" is likely doing top-1 path tracking or 
 |---------|------------|-------------|
 | V1 (Naive) | 52K obs/sec | Reference implementation |
 | V2 | 525K obs/sec | Ping-pong buffers, AVX2 kernel |
-| **V3.1** | **3.01M obs/sec** | Native interleaved layout, optimized ASM |
+| V3 | 1.5M obs/sec | Native interleaved layout |
+| **V3.2** | **5.14M obs/sec** | Optimized ASM kernel, pool allocator |
 
 ---
 
