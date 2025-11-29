@@ -1,7 +1,13 @@
 /**
  * @file bocpd_ultra_opt_asm.c
  * @brief Ultra-Optimized Bayesian Online Changepoint Detection (BOCPD)
- * @version 3.0 - Native Interleaved Layout
+ * @version 3.1 - Native Interleaved Layout with Consistent Math
+ *
+ * @section changes_v31 V3.1 Changes
+ *
+ * Fixed scalar/SIMD consistency: The scalar tail now uses fast_lgamma_scalar()
+ * that matches the SIMD approximation, ensuring bit-reproducible results
+ * regardless of input size alignment.
  *
  * @section changes_v3 V3 Changes
  *
@@ -205,6 +211,119 @@ static inline __m256d fast_log_avx2(__m256d x)
     poly = _mm256_fmadd_pd(t2, poly, one);
 
     return _mm256_fmadd_pd(e, ln2, _mm256_mul_pd(two, _mm256_mul_pd(t, poly)));
+}
+
+/**
+ * @brief Fast scalar lgamma using Lanczos approximation for x < 40.
+ *
+ * This function matches the SIMD lgamma_lanczos_avx2() implementation
+ * to ensure bit-reproducible results between scalar and vector paths.
+ *
+ * @param x Input value (must be positive, typically > 0.5 for BOCPD)
+ * @return ln(Γ(x))
+ */
+static inline double fast_lgamma_lanczos_scalar(double x)
+{
+    const double half = 0.5;
+    const double one = 1.0;
+    const double half_ln2pi = 0.9189385332046727;
+    const double g = 4.7421875;
+
+    /* Lanczos coefficients for g=4.7421875 */
+    const double c0 = 1.000000000190015;
+    const double c1 = 76.18009172947146;
+    const double c2 = -86.50532032941677;
+    const double c3 = 24.01409824083091;
+    const double c4 = -1.231739572450155;
+    const double c5 = 0.001208650973866179;
+
+    double xp0 = x;
+    double xp1 = x + one;
+    double xp2 = x + 2.0;
+    double xp3 = x + 3.0;
+    double xp4 = x + 4.0;
+
+    /* Sum rational terms */
+    double Ag = c0;
+    Ag += c1 / xp0;
+    Ag += c2 / xp1;
+    Ag += c3 / xp2;
+    Ag += c4 / xp3;
+    Ag += c5 / xp4;
+
+    double t = x + g - half;
+    double ln_t = fast_log_scalar(t);
+    double ln_Ag = fast_log_scalar(Ag);
+
+    double result = half_ln2pi;
+    result += (x - half) * ln_t;
+    result -= t;
+    result += ln_Ag;
+
+    return result;
+}
+
+/**
+ * @brief Fast scalar lgamma using Stirling's expansion for x > 40.
+ *
+ * This function matches the SIMD lgamma_stirling_avx2() implementation
+ * to ensure bit-reproducible results between scalar and vector paths.
+ *
+ * @param x Input value (should be > 40 for best accuracy)
+ * @return ln(Γ(x))
+ */
+static inline double fast_lgamma_stirling_scalar(double x)
+{
+    const double half = 0.5;
+    const double one = 1.0;
+    const double half_ln2pi = 0.9189385332046727;
+
+    /* Stirling coefficients */
+    const double s1 = 0.0833333333333333333;
+    const double s2 = -0.00277777777777777778;
+    const double s3 = 0.000793650793650793651;
+    const double s4 = -0.000595238095238095238;
+    const double s5 = 0.000841750841750841751;
+    const double s6 = -0.00191752691752691753;
+
+    double ln_x = fast_log_scalar(x);
+    double base = (x - half) * ln_x + half_ln2pi - x;
+
+    double inv_x = one / x;
+    double inv_x2 = inv_x * inv_x;
+
+    /* Horner evaluation */
+    double correction = s6;
+    correction = correction * inv_x2 + s5;
+    correction = correction * inv_x2 + s4;
+    correction = correction * inv_x2 + s3;
+    correction = correction * inv_x2 + s2;
+    correction = correction * inv_x2 + s1;
+    correction *= inv_x;
+
+    return base + correction;
+}
+
+/**
+ * @brief Unified scalar lgamma matching the SIMD fast_lgamma_avx2().
+ *
+ * Uses Lanczos for x <= 40, Stirling for x > 40, matching the SIMD version
+ * to ensure consistent results regardless of whether scalar or SIMD path
+ * processes a given element.
+ *
+ * @param x Input value (must be positive)
+ * @return ln(Γ(x))
+ */
+static inline double fast_lgamma_scalar(double x)
+{
+    if (x > 40.0)
+    {
+        return fast_lgamma_stirling_scalar(x);
+    }
+    else
+    {
+        return fast_lgamma_lanczos_scalar(x);
+    }
 }
 
 /**
@@ -451,6 +570,12 @@ static inline void init_slot_zero(bocpd_asm_t *b)
  * This function replaces both update_posteriors_fused() AND build_interleaved()
  * from V2. Everything happens in a single pass with no intermediate buffers.
  *
+ * @par V3.1 Consistency Fix
+ *
+ * The scalar tail now uses fast_lgamma_scalar() instead of libm's lgamma(),
+ * ensuring identical results regardless of whether an element is processed
+ * by the SIMD or scalar path.
+ *
  * @par Algorithm
  *
  * For each run length i in [0, n_old):
@@ -562,7 +687,15 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
         store_shifted_field(next, block, BOCPD_IBLK_INV_SSN, inv_ssn);
     }
 
-    /* Scalar tail for remaining 0-3 elements */
+    /*-------------------------------------------------------------------------
+     * Scalar tail for remaining 0-3 elements
+     *
+     * V3.1: Uses fast_lgamma_scalar() instead of libm's lgamma() to ensure
+     * consistent results with the SIMD path. This is critical for:
+     * - Reproducibility across different input sizes
+     * - Deterministic behavior in testing
+     * - Avoiding subtle discontinuities at SIMD/scalar boundaries
+     *-------------------------------------------------------------------------*/
     for (; i < n_old; i++)
     {
         double ss_n_old = IBLK_GET_SS_N(cur, i);
@@ -581,8 +714,9 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
         double nu = 2.0 * alpha_new;
         double inv_ssn = 1.0 / (sigma_sq * nu);
 
-        double lg_a = lgamma(alpha_new);
-        double lg_ap5 = lgamma(alpha_new + 0.5);
+        /* V3.1: Use fast_lgamma_scalar() to match SIMD path */
+        double lg_a = fast_lgamma_scalar(alpha_new);
+        double lg_ap5 = fast_lgamma_scalar(alpha_new + 0.5);
         double C1 = lg_ap5 - lg_a - 0.5 * fast_log_scalar(nu * M_PI * sigma_sq);
         double C2 = alpha_new + 0.5;
 
@@ -965,8 +1099,12 @@ int bocpd_ultra_init(bocpd_asm_t *b, double hazard_lambda,
     b->prior = prior;
     b->cur_buf = 0;
 
-    b->prior_lgamma_alpha = lgamma(prior.alpha0);
-    b->prior_lgamma_alpha_p5 = lgamma(prior.alpha0 + 0.5);
+    /*
+     * V3.1: Use fast_lgamma_scalar for prior lgamma values to maintain
+     * consistency with the approximation used in update loops.
+     */
+    b->prior_lgamma_alpha = fast_lgamma_scalar(prior.alpha0);
+    b->prior_lgamma_alpha_p5 = fast_lgamma_scalar(prior.alpha0 + 0.5);
 
     /*
      * Memory layout (V3):
@@ -1078,8 +1216,10 @@ void bocpd_ultra_step(bocpd_asm_t *b, double x)
 
         double sigma_sq = beta1 * (k1 + 1.0) / (a1 * k1);
         double nu = 2.0 * a1;
-        double lg_a = lgamma(a1);
-        double lg_ap5 = lgamma(a1 + 0.5);
+
+        /* V3.1: Use fast_lgamma_scalar for consistency */
+        double lg_a = fast_lgamma_scalar(a1);
+        double lg_ap5 = fast_lgamma_scalar(a1 + 0.5);
         double C1 = lg_ap5 - lg_a - 0.5 * fast_log_scalar(nu * M_PI * sigma_sq);
         double C2 = a1 + 0.5;
 
@@ -1161,8 +1301,9 @@ int bocpd_pool_init(bocpd_pool_t *pool, size_t n_detectors,
     pool->n_detectors = n_detectors;
     pool->bytes_per_detector = bytes_per_detector;
 
-    double prior_lgamma_alpha = lgamma(prior.alpha0);
-    double prior_lgamma_alpha_p5 = lgamma(prior.alpha0 + 0.5);
+    /* V3.1: Use fast_lgamma_scalar for consistency */
+    double prior_lgamma_alpha = fast_lgamma_scalar(prior.alpha0);
+    double prior_lgamma_alpha_p5 = fast_lgamma_scalar(prior.alpha0 + 0.5);
 
     uint8_t *data_base = (uint8_t *)mega + struct_size;
 
