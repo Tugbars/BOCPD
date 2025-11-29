@@ -130,6 +130,8 @@ void bocpd_pool_free(bocpd_pool_t *pool);
 void bocpd_pool_reset(bocpd_pool_t *pool);
 bocpd_asm_t *bocpd_pool_get(bocpd_pool_t *pool, size_t index);
 
+double iblk_get(const double *buf, size_t idx, size_t field_offset);
+
 /* Assembly kernel interface - now reads directly from interleaved buffer */
 /* Assembly kernel interface - now reads directly from interleaved buffer */
 typedef struct bocpd_kernel_args {

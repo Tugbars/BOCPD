@@ -68,6 +68,7 @@ static double randn(double mu, double sigma)
 static int test_mean_shift(void)
 {
     printf("=== Test: Mean Shift Detection (ASM Kernel) ===\n");
+    fflush(stdout);
 
     bocpd_asm_t cpd;
     bocpd_prior_t prior = {0.0, 1.0, 1.0, 1.0};
@@ -77,6 +78,11 @@ static int test_mean_shift(void)
         printf("FAIL: Could not initialize BOCPD\n");
         return -1;
     }
+
+    printf("trunc_thresh = %.2e\n", cpd.trunc_thresh);
+    printf("hazard = %.6f (1/lambda = 1/250)\n", cpd.hazard);
+    printf("capacity = %llu\n", (unsigned long long)cpd.capacity);
+    fflush(stdout);
 
     srand(12345);
 
@@ -90,32 +96,71 @@ static int test_mean_shift(void)
 
     printf("Data: N(0,1) for %d samples, then N(5,1) for %d samples\n", n1, n2);
     printf("True change point at t=%d\n\n", n1);
+    fflush(stdout);
 
     for (int t = 0; t < n_total; t++)
     {
+        printf(">>> BEFORE step t=%d\n", t);
+        fflush(stdout);
+
         double x = (t < n1) ? randn(0.0, 1.0) : randn(5.0, 1.0);
 
+        printf(">>> Calling bocpd_ultra_step(x=%.3f), active_len=%llu\n", x, (unsigned long long)cpd.active_len);
+        fflush(stdout);
+
         bocpd_ultra_step(&cpd, x);
+
+        printf(">>> AFTER step t=%d, active_len=%llu\n", t, (unsigned long long)cpd.active_len);
+        fflush(stdout);
+
         size_t map_rl = bocpd_ultra_get_map(&cpd);
         double p_change = bocpd_ultra_get_change_prob(&cpd);
 
-        if (t >= n1 - 5 && t <= n1 + 10)
+        printf(">>> t=%d: map_rl=%llu, p_change=%.6f, r[0]=%.6e\n", 
+               t, (unsigned long long)map_rl, p_change, cpd.r[0]);
+        fflush(stdout);
+
+        /* Check for NaN */
+        if (isnan(p_change))
         {
-            printf("t=%3d: x=%7.3f  MAP_rl=%3zu  P(rl<5)=%.4f %s\n",
-                   t, x, map_rl, p_change,
-                   (map_rl < 5 && prev_map_rl > 10) ? " <-- CHANGE" : "");
+            printf("ERROR: p_change is NaN at t=%d!\n", t);
+            fflush(stdout);
+            break;
+        }
+        if (isnan(cpd.r[0]))
+        {
+            printf("ERROR: r[0] is NaN at t=%d!\n", t);
+            fflush(stdout);
+            break;
+        }
+
+        /* Stop detailed output after t=10 to reduce noise */
+        if (t >= 10)
+        {
+            /* Just print summary every 10 steps */
+            if (t % 10 == 0)
+            {
+                printf("t=%d: active_len=%llu, map_rl=%llu, p_change=%.4f\n",
+                       t, (unsigned long long)cpd.active_len, 
+                       (unsigned long long)map_rl, p_change);
+                fflush(stdout);
+            }
         }
 
         if (!change_detected && t >= n1 && map_rl < 5 && prev_map_rl > 10)
         {
             change_detected = 1;
             detection_time = t;
+            printf("*** CHANGE DETECTED at t=%d ***\n", t);
+            fflush(stdout);
         }
 
         prev_map_rl = map_rl;
     }
 
-    printf("\n");
+    printf("\nLoop finished.\n");
+    fflush(stdout);
+
     if (change_detected)
     {
         printf("PASS: Change detected at t=%d (true: %d, delay: %d)\n",

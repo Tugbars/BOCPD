@@ -46,24 +46,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include <immintrin.h>
+#include <stdio.h>
 
 #ifndef BOCPD_USE_ASM_KERNEL
 #define BOCPD_USE_ASM_KERNEL 1
 #endif
 
- /**
-     * @brief Read a scalar value from the interleaved buffer
-     *
-     * @param buf           Base pointer to interleaved buffer
-     * @param idx           Logical element index (0 to capacity-1)
-     * @param field_offset  Byte offset of field within superblock
-     *                      (e.g., BOCPD_IBLK_MU = 0, BOCPD_IBLK_ALPHA = 160)
-     *
-     * @return The scalar value at the computed location
-     *
-     * @note This is O(1) - just index arithmetic, no searching
-     */
-    static inline double iblk_get(const double *buf, size_t idx, size_t field_offset)
+/**
+ * @brief Read a scalar value from the interleaved buffer
+ *
+ * @param buf           Base pointer to interleaved buffer
+ * @param idx           Logical element index (0 to capacity-1)
+ * @param field_offset  Byte offset of field within superblock
+ *                      (e.g., BOCPD_IBLK_MU = 0, BOCPD_IBLK_ALPHA = 160)
+ *
+ * @return The scalar value at the computed location
+ *
+ * @note This is O(1) - just index arithmetic, no searching
+ */
+double iblk_get(const double *buf, size_t idx, size_t field_offset)
 {
     size_t block = idx / 4; /* Which 4-element superblock */
     size_t lane = idx & 3;  /* Which lane (0-3), using & for speed */
@@ -1370,19 +1371,23 @@ static inline void process_block_common(
  */
 static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old)
 {
-    /* Always initialize slot 0 with prior (changepoint hypothesis) */
+    printf("      [UPDATE] entered, n_old=%llu\n", (unsigned long long)n_old);
+    fflush(stdout);
+
     init_slot_zero(b);
+
+    printf("      [UPDATE] after init_slot_zero\n");
+    fflush(stdout);
 
     if (n_old == 0)
     {
-        b->cur_buf = 1 - b->cur_buf; /* Swap buffers */
+        b->cur_buf = 1 - b->cur_buf;
         return;
     }
 
     const double *cur = BOCPD_CUR_BUF(b);
     double *next = BOCPD_NEXT_BUF(b);
 
-    /* Broadcast constants for SIMD operations */
     const __m256d x_vec = _mm256_set1_pd(x);
     const __m256d one = _mm256_set1_pd(1.0);
     const __m256d two = _mm256_set1_pd(2.0);
@@ -1390,53 +1395,29 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
     const __m256d pi = _mm256_set1_pd(M_PI);
 
     const double alpha0 = b->prior.alpha0;
-    const size_t n_blocks = (n_old + 3) / 4; /* Ceiling division */
+    const size_t n_blocks = (n_old + 3) / 4;
 
-    /* ═════════════════════════════════════════════════════════════════════
-     * CALCULATE REGION TRANSITION BLOCKS
-     *
-     * For block k, α_new ∈ [α₀ + 2k + 0.5, α₀ + 2k + 2.0]
-     * ═════════════════════════════════════════════════════════════════════ */
+    printf("      [UPDATE] n_blocks=%llu, alpha0=%.2f\n", (unsigned long long)n_blocks, alpha0);
+    fflush(stdout);
 
-    /* ─────────────────────────────────────────────────────────────────────
-     * LANCZOS SAFE END: block k where max(α_new) < 8
-     *   α₀ + 2k + 2.0 < 8  →  k < (6 - α₀) / 2
-     * ───────────────────────────────────────────────────────────────────── */
+    /* Calculate region boundaries */
     size_t lanczos_safe_end;
     if (alpha0 >= 6.0)
-    {
-        lanczos_safe_end = 0; /* α already ≥ 8 at block 0 */
-    }
+        lanczos_safe_end = 0;
     else
-    {
         lanczos_safe_end = (size_t)((6.0 - alpha0) / 2.0);
-        if (lanczos_safe_end > n_blocks)
-            lanczos_safe_end = n_blocks;
-    }
+    if (lanczos_safe_end > n_blocks)
+        lanczos_safe_end = n_blocks;
 
-    /* ─────────────────────────────────────────────────────────────────────
-     * MINIMAX SAFE START: block k where min(α_new) ≥ 8
-     *   α₀ + 2k + 0.5 ≥ 8  →  k ≥ ceil((7.5 - α₀) / 2)
-     * ───────────────────────────────────────────────────────────────────── */
     size_t minimax_safe_start;
     if (alpha0 >= 7.5)
-    {
-        minimax_safe_start = 0; /* Already in minimax range */
-    }
+        minimax_safe_start = 0;
     else
-    {
         minimax_safe_start = (size_t)ceil((7.5 - alpha0) / 2.0);
-    }
 
-    /* ─────────────────────────────────────────────────────────────────────
-     * MINIMAX SAFE END: block k where max(α_new) < 40
-     *   α₀ + 2k + 2.0 < 40  →  k < (38 - α₀) / 2
-     * ───────────────────────────────────────────────────────────────────── */
     size_t minimax_safe_end;
     if (alpha0 >= 38.0)
-    {
-        minimax_safe_end = 0; /* Already past minimax range */
-    }
+        minimax_safe_end = 0;
     else
     {
         minimax_safe_end = (size_t)((38.0 - alpha0) / 2.0);
@@ -1444,114 +1425,160 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
             minimax_safe_end = n_blocks;
     }
 
-    /* ─────────────────────────────────────────────────────────────────────
-     * STIRLING SAFE START: block k where min(α_new) ≥ 40
-     *   α₀ + 2k + 0.5 ≥ 40  →  k ≥ ceil((39.5 - α₀) / 2)
-     * ───────────────────────────────────────────────────────────────────── */
     size_t stirling_safe_start;
     if (alpha0 >= 39.5)
-    {
-        stirling_safe_start = 0; /* Already in Stirling range */
-    }
+        stirling_safe_start = 0;
     else
-    {
         stirling_safe_start = (size_t)ceil((39.5 - alpha0) / 2.0);
-    }
+
+    printf("      [UPDATE] lanczos_safe_end=%llu, minimax_safe_start=%llu, minimax_safe_end=%llu, stirling_safe_start=%llu\n",
+           (unsigned long long)lanczos_safe_end,
+           (unsigned long long)minimax_safe_start,
+           (unsigned long long)minimax_safe_end,
+           (unsigned long long)stirling_safe_start);
+    fflush(stdout);
 
     size_t block = 0;
 
-    /* ═════════════════════════════════════════════════════════════════════
-     * REGION 1: Pure Lanczos (all α < 8)
-     * ═════════════════════════════════════════════════════════════════════ */
+    /* REGION 1: Pure Lanczos */
+    printf("      [UPDATE] Starting Lanczos region\n");
+    fflush(stdout);
     for (; block < lanczos_safe_end && block < n_blocks; block++)
     {
         if (block * 4 >= n_old)
             break;
+        printf("        [LANCZOS] block %llu (indices %llu-%llu)\n", 
+               (unsigned long long)block,
+               (unsigned long long)(block * 4),
+               (unsigned long long)(block * 4 + 3));
+        fflush(stdout);
+
         const double *src = cur + block * BOCPD_IBLK_DOUBLES;
         process_block_common(src, next, block, x_vec, one, two, half, pi,
                              lgamma_lanczos_avx2);
+
+        printf("        [LANCZOS] block %llu done\n", (unsigned long long)block);
+        fflush(stdout);
     }
 
-    /* ═════════════════════════════════════════════════════════════════════
-     * REGION 2: Transition zone (spans Lanczos/Minimax boundary at α=8)
-     * ═════════════════════════════════════════════════════════════════════ */
+    /* REGION 2: Transition (Lanczos/Minimax boundary) */
+    printf("      [UPDATE] Starting transition region 1\n");
+    fflush(stdout);
     for (; block < minimax_safe_start && block < n_blocks; block++)
     {
         if (block * 4 >= n_old)
             break;
+        printf("        [TRANS1] block %llu (indices %llu-%llu)\n",
+               (unsigned long long)block,
+               (unsigned long long)(block * 4),
+               (unsigned long long)(block * 4 + 3));
+        fflush(stdout);
+
         const double *src = cur + block * BOCPD_IBLK_DOUBLES;
         process_block_common(src, next, block, x_vec, one, two, half, pi,
-                             fast_lgamma_avx2_branchless); /* Computes all 3 */
+                             fast_lgamma_avx2_branchless);
+
+        printf("        [TRANS1] block %llu done\n", (unsigned long long)block);
+        fflush(stdout);
     }
 
-    /* ═════════════════════════════════════════════════════════════════════
-     * REGION 3: Pure Minimax (8 ≤ α < 40)
-     * ═════════════════════════════════════════════════════════════════════ */
+    /* REGION 3: Pure Minimax */
+    printf("      [UPDATE] Starting Minimax region\n");
+    fflush(stdout);
     for (; block < minimax_safe_end && block < n_blocks; block++)
     {
         if (block * 4 >= n_old)
             break;
+        printf("        [MINIMAX] block %llu\n", (unsigned long long)block);
+        fflush(stdout);
+
         const double *src = cur + block * BOCPD_IBLK_DOUBLES;
         process_block_common(src, next, block, x_vec, one, two, half, pi,
                              lgamma_minimax_avx2);
+
+        printf("        [MINIMAX] block %llu done\n", (unsigned long long)block);
+        fflush(stdout);
     }
 
-    /* ═════════════════════════════════════════════════════════════════════
-     * REGION 4: Transition zone (spans Minimax/Stirling boundary at α=40)
-     * ═════════════════════════════════════════════════════════════════════ */
+    /* REGION 4: Transition (Minimax/Stirling boundary) */
+    printf("      [UPDATE] Starting transition region 2\n");
+    fflush(stdout);
     for (; block < stirling_safe_start && block < n_blocks; block++)
     {
         if (block * 4 >= n_old)
             break;
+        printf("        [TRANS2] block %llu\n", (unsigned long long)block);
+        fflush(stdout);
+
         const double *src = cur + block * BOCPD_IBLK_DOUBLES;
         process_block_common(src, next, block, x_vec, one, two, half, pi,
-                             fast_lgamma_avx2_branchless); /* Computes all 3 */
+                             fast_lgamma_avx2_branchless);
+
+        printf("        [TRANS2] block %llu done\n", (unsigned long long)block);
+        fflush(stdout);
     }
 
-    /* ═════════════════════════════════════════════════════════════════════
-     * REGION 5: Pure Stirling (α ≥ 40)
-     * ═════════════════════════════════════════════════════════════════════ */
+    /* REGION 5: Pure Stirling */
+    printf("      [UPDATE] Starting Stirling region\n");
+    fflush(stdout);
     for (; block < n_blocks; block++)
     {
         if (block * 4 >= n_old)
             break;
+        printf("        [STIRLING] block %llu\n", (unsigned long long)block);
+        fflush(stdout);
+
         const double *src = cur + block * BOCPD_IBLK_DOUBLES;
         process_block_common(src, next, block, x_vec, one, two, half, pi,
                              lgamma_stirling_avx2);
+
+        printf("        [STIRLING] block %llu done\n", (unsigned long long)block);
+        fflush(stdout);
     }
 
-    /* ═════════════════════════════════════════════════════════════════════
-     * SCALAR TAIL: Handle remaining 0-3 elements that don't fill a block
-     * ═════════════════════════════════════════════════════════════════════ */
+    /* Scalar tail */
+    printf("      [UPDATE] Starting scalar tail, block=%llu\n", (unsigned long long)block);
+    fflush(stdout);
+
     size_t i = block * 4;
+    printf("      [UPDATE] Scalar tail starting at i=%llu, n_old=%llu\n", 
+           (unsigned long long)i, (unsigned long long)n_old);
+    fflush(stdout);
+
     for (; i < n_old; i++)
     {
+        printf("        [SCALAR] i=%llu\n", (unsigned long long)i);
+        fflush(stdout);
+
         double ss_n_old = IBLK_GET_SS_N(cur, i);
         double kappa_old = IBLK_GET_KAPPA(cur, i);
         double mu_old = IBLK_GET_MU(cur, i);
         double alpha_old = IBLK_GET_ALPHA(cur, i);
         double beta_old = IBLK_GET_BETA(cur, i);
 
-        /* Welford update */
+        printf("        [SCALAR] i=%llu: kappa=%.2f, alpha=%.2f, beta=%.4f\n",
+               (unsigned long long)i, kappa_old, alpha_old, beta_old);
+        fflush(stdout);
+
         double ss_n_new = ss_n_old + 1.0;
         double kappa_new = kappa_old + 1.0;
         double mu_new = (kappa_old * mu_old + x) / kappa_new;
         double alpha_new = alpha_old + 0.5;
         double beta_new = beta_old + 0.5 * (x - mu_old) * (x - mu_new);
 
-        /* Student-t parameters */
         double sigma_sq = beta_new * (kappa_new + 1.0) / (alpha_new * kappa_new);
         double nu = 2.0 * alpha_new;
         double inv_ssn = 1.0 / (sigma_sq * nu);
 
-        /* Use glibc lgamma for scalar tail (rare, not performance critical) */
         double lg_a = lgamma(alpha_new);
         double lg_ap5 = lgamma(alpha_new + 0.5);
         double C1 = lg_ap5 - lg_a - 0.5 * fast_log_scalar(nu * M_PI * sigma_sq);
         double C2 = alpha_new + 0.5;
 
-        /* Store at shifted index */
         size_t out_idx = i + 1;
+        printf("        [SCALAR] writing to out_idx=%llu\n", (unsigned long long)out_idx);
+        fflush(stdout);
+
         IBLK_SET_MU(next, out_idx, mu_new);
         IBLK_SET_KAPPA(next, out_idx, kappa_new);
         IBLK_SET_ALPHA(next, out_idx, alpha_new);
@@ -1560,10 +1587,18 @@ static void update_posteriors_interleaved(bocpd_asm_t *b, double x, size_t n_old
         IBLK_SET_C1(next, out_idx, C1);
         IBLK_SET_C2(next, out_idx, C2);
         IBLK_SET_INV_SSN(next, out_idx, inv_ssn);
+
+        printf("        [SCALAR] i=%llu done\n", (unsigned long long)i);
+        fflush(stdout);
     }
 
-    /* Swap ping-pong buffers: NEXT becomes CUR for next iteration */
+    printf("      [UPDATE] Swapping buffers\n");
+    fflush(stdout);
+
     b->cur_buf = 1 - b->cur_buf;
+
+    printf("      [UPDATE] done\n");
+    fflush(stdout);
 }
 
 /*=============================================================================
@@ -2008,6 +2043,30 @@ int bocpd_ultra_init(bocpd_asm_t *b, double hazard_lambda,
     ptr += bytes_r;
     b->r_scratch = (double *)ptr;
 
+    /* Pre-initialize both interleaved buffers with safe prior values */
+    for (int buf_idx = 0; buf_idx < 2; buf_idx++)
+    {
+        double *interleaved = b->interleaved[buf_idx];
+        size_t n_blocks_total = n_blocks;  /* Already computed above */
+        
+        for (size_t blk = 0; blk < n_blocks_total; blk++)
+        {
+            double *base = interleaved + blk * BOCPD_IBLK_DOUBLES;
+            
+            for (int lane = 0; lane < 4; lane++)
+            {
+                base[BOCPD_IBLK_MU / 8 + lane] = prior.mu0;
+                base[BOCPD_IBLK_KAPPA / 8 + lane] = prior.kappa0;
+                base[BOCPD_IBLK_ALPHA / 8 + lane] = prior.alpha0;
+                base[BOCPD_IBLK_BETA / 8 + lane] = prior.beta0;
+                base[BOCPD_IBLK_SS_N / 8 + lane] = 0.0;
+                base[BOCPD_IBLK_C1 / 8 + lane] = lgamma(prior.alpha0) - 0.5 * log(2.0 * M_PI);
+                base[BOCPD_IBLK_C2 / 8 + lane] = prior.alpha0 + 0.5;
+                base[BOCPD_IBLK_INV_SSN / 8 + lane] = 1.0 / (2.0 * prior.beta0);
+            }
+        }
+    }
+
     b->mega = mega;
     b->mega_bytes = total;
     b->t = 0;
@@ -2154,8 +2213,17 @@ void bocpd_ultra_step(bocpd_asm_t *b, double x)
     }
 
     size_t n_old = b->active_len;
+    printf("    [STEP] n_old=%llu, calling prediction_step\n", (unsigned long long)n_old);
+    fflush(stdout);
     prediction_step(b, x);
+    printf("    [STEP] after prediction_step, active_len=%llu\n", (unsigned long long)b->active_len);
+    fflush(stdout);
+    printf("    [STEP] calling update_posteriors_interleaved\n");
+    fflush(stdout);
     update_posteriors_interleaved(b, x, n_old);
+      
+    printf("    [STEP] after update_posteriors_interleaved\n");
+    fflush(stdout);
     b->t++;
 
     /* Compute changepoint probability as sum of first 5 run-lengths */
