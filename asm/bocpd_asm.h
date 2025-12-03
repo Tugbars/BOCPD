@@ -212,6 +212,14 @@ extern "C" {
 #define aligned_free(ptr) free(ptr)
 #endif
 
+#if defined(_MSC_VER)
+    #define BOCPD_ALIGNAS(x) __declspec(align(x))
+#elif defined(__GNUC__)
+    #define BOCPD_ALIGNAS(x) __attribute__((aligned(x)))
+#else
+    #define BOCPD_ALIGNAS(x)
+#endif
+
 /*=============================================================================
  * V3 INTERLEAVED BLOCK LAYOUT
  *=============================================================================
@@ -452,7 +460,7 @@ typedef struct bocpd_asm {
     size_t mega_bytes;     /**< Size of mega allocation in bytes.
                                 0 for pool-allocated detectors. */
     
-} bocpd_asm_t;
+} BOCPD_ALIGNAS(64) bocpd_asm_t;
 
 /*=============================================================================
  * BUFFER ACCESS MACROS
