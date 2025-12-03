@@ -31,10 +31,10 @@ message(STATUS "Kernel variant: ${BOCPD_KERNEL_VARIANT}")
 #===============================================================================
 
 if(MSVC)
-    set(BOCPD_COMPILE_FLAGS /arch:AVX2 /W4 /O2)
+    set(BOCPD_COMPILE_FLAGS /arch:AVX2 /W4 /O1)
     set(BOCPD_LINK_FLAGS)
 else()
-    set(BOCPD_COMPILE_FLAGS -march=native -mavx2 -mfma -O3 -Wall -Wextra)
+    set(BOCPD_COMPILE_FLAGS -march=native -mavx2 -mfma -O3 -Wall -Wextra -mstackrealign)
     set(BOCPD_LINK_FLAGS -lm)
 endif()
 
